@@ -96,6 +96,7 @@ public sealed class ProfileController : ControllerBase
     [SwaggerOperation(Summary = "Get a public profile by username",
         OperationId = "Profile_GetPublic", Tags = new[] { "Profile" })]
     [ProducesResponseType(typeof(ProfileDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status403Forbidden)]
     [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> GetPublicProfile([FromRoute] string username, CancellationToken ct)
     {

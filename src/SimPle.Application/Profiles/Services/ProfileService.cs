@@ -15,6 +15,7 @@ public sealed class ProfileService : IProfileService
     private readonly IUsernameChangeRequestRepository _usernameRequests;
     private readonly IFileStorageService _storage;
     private readonly StorageOptions _storageOptions;
+    private readonly IFriendRepository _friends;
 
     private static readonly HashSet<string> AllowedImageTypes =
         new(StringComparer.OrdinalIgnoreCase) { "image/jpeg", "image/png", "image/webp" };
@@ -24,13 +25,15 @@ public sealed class ProfileService : IProfileService
         IProfileRepository profiles,
         IUsernameChangeRequestRepository usernameRequests,
         IFileStorageService storage,
-        IOptions<StorageOptions> storageOptions)
+        IOptions<StorageOptions> storageOptions,
+        IFriendRepository friends)
     {
         _users = users;
         _profiles = profiles;
         _usernameRequests = usernameRequests;
         _storage = storage;
         _storageOptions = storageOptions.Value;
+        _friends = friends;
     }
 
     public async Task<Result<ProfileDto>> GetMyProfileAsync(Guid userId, CancellationToken ct = default)
@@ -51,8 +54,17 @@ public sealed class ProfileService : IProfileService
         if (user.Visibility == ProfileVisibility.Private && user.Id != requesterId)
             return Result<ProfileDto>.Fail("Profile.Private", "This profile is private.");
 
+        // Bidirectional block: either direction → not visible (403, not 404)
+        if (requesterId.HasValue
+            && await _friends.IsBlockedInEitherDirectionAsync(user.Id, requesterId.Value, ct))
+            return Result<ProfileDto>.Fail("Profile.Blocked", "This profile is not available.");
+
+        // FriendsOnly: real accepted-friend check (replaces Module 2 owner-only stub)
         if (user.Visibility == ProfileVisibility.FriendsOnly && user.Id != requesterId)
-            return Result<ProfileDto>.Fail("Profile.FriendsOnly", "This profile is visible to friends only.");
+        {
+            if (!requesterId.HasValue || !await _friends.AreFriendsAsync(user.Id, requesterId.Value, ct))
+                return Result<ProfileDto>.Fail("Profile.FriendsOnly", "This profile is visible to friends only.");
+        }
 
         return await BuildDtoAsync(user, ct);
     }
@@ -361,7 +373,8 @@ public sealed class ProfileService : IProfileService
     {
         var links = await _profiles.GetLinksByUserIdAsync(user.Id, ct);
         var interests = await _profiles.GetInterestsByUserIdAsync(user.Id, ct);
-        return Result<ProfileDto>.Ok(await ToDtoAsync(user, links, interests, ct));
+        var friendCount = await _friends.GetFriendCountAsync(user.Id, ct);
+        return Result<ProfileDto>.Ok(await ToDtoAsync(user, links, interests, friendCount, ct));
     }
 
     private static UsernameChangeRequestDto ToRequestDto(UsernameChangeRequest r) => new(
@@ -374,6 +387,7 @@ public sealed class ProfileService : IProfileService
         User user,
         IReadOnlyList<ProfileExternalLink> links,
         IReadOnlyList<ProfileInterestTag> interests,
+        int friendCount,
         CancellationToken ct)
     {
         var readExpiry = TimeSpan.FromMinutes(_storageOptions.ReadUrlExpiryMinutes);
@@ -403,6 +417,7 @@ public sealed class ProfileService : IProfileService
             Role: user.Role.ToString(),
             Level: user.Level,
             Elo: user.Elo,
+            FriendCount: friendCount,
             JoinedAt: user.CreatedAt,
             Links: links.Select(ToLinkDto).ToList(),
             Interests: interests.Select(t => t.Name).ToList());
