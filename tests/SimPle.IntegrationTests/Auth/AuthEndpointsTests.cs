@@ -572,7 +572,9 @@ public sealed class AuthEndpointsTests : IDisposable
         }
 
         response!.StatusCode.Should().Be(HttpStatusCode.TooManyRequests);
-        (await response.Content.ReadAsStringAsync()).Should().Contain("Auth.RateLimitExceeded");
+        // Module 3 reconciliation R12: the global OnRejected handler now emits the canonical
+        // catalogue code RateLimit.Exceeded (was the per-endpoint Auth.RateLimitExceeded).
+        (await response.Content.ReadAsStringAsync()).Should().Contain("RateLimit.Exceeded");
     }
 
     // ── Swagger ───────────────────────────────────────────────────────────────

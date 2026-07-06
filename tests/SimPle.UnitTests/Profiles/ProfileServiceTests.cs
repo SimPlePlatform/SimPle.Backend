@@ -4,6 +4,7 @@ using NSubstitute;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
 using SimPle.Application.Profiles.DTOs;
+using SimPle.Domain.Friends;
 using SimPle.Domain.Profiles;
 using SimPle.Application.Profiles.Services;
 using SimPle.Application.Profiles.Validators;
@@ -17,6 +18,7 @@ public sealed class ProfileServiceTests
     private readonly IProfileRepository _profiles = Substitute.For<IProfileRepository>();
     private readonly IUsernameChangeRequestRepository _usernameRequests = Substitute.For<IUsernameChangeRequestRepository>();
     private readonly IFileStorageService _storage = Substitute.For<IFileStorageService>();
+    private readonly IFriendRepository _friends = Substitute.For<IFriendRepository>();
     private readonly ProfileService _service;
     private readonly StorageOptions _storageOptions = new()
     {
@@ -37,7 +39,11 @@ public sealed class ProfileServiceTests
         _storage.CreatePresignedReadUrlAsync(Arg.Any<string>(), Arg.Any<TimeSpan>())
             .Returns(x => $"https://read.example.test/{x.ArgAt<string>(0)}");
         _storage.ObjectExistsAsync(Arg.Any<string>()).Returns(true);
-        _service = new ProfileService(_users, _profiles, _usernameRequests, _storage, Options.Create(_storageOptions));
+        // Default: not blocked, not friends, 0 friend count
+        _friends.IsBlockedInEitherDirectionAsync(Arg.Any<Guid>(), Arg.Any<Guid>()).Returns(false);
+        _friends.AreFriendsAsync(Arg.Any<Guid>(), Arg.Any<Guid>()).Returns(false);
+        _friends.GetFriendCountAsync(Arg.Any<Guid>()).Returns(0);
+        _service = new ProfileService(_users, _profiles, _usernameRequests, _storage, Options.Create(_storageOptions), _friends);
     }
 
     private static User MakeUser(string username = "testuser") =>
@@ -111,16 +117,72 @@ public sealed class ProfileServiceTests
     }
 
     [Fact]
-    public async Task GetPublicProfile_FriendsOnly_TreatedAsOwnerOnly()
+    public async Task GetPublicProfile_FriendsOnly_StrangerDenied()
     {
         var user = MakeUser();
         user.UpdateProfile("Test", null, visibility: ProfileVisibility.FriendsOnly);
         _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        // Default mock: AreFriendsAsync returns false
 
         var result = await _service.GetPublicProfileAsync("testuser", Guid.NewGuid());
 
         result.IsSuccess.Should().BeFalse();
         result.Error!.Code.Should().Be("Profile.FriendsOnly");
+    }
+
+    [Fact]
+    public async Task GetPublicProfile_FriendsOnly_Friend_Visible()
+    {
+        var user = MakeUser();
+        user.UpdateProfile("Test", null, visibility: ProfileVisibility.FriendsOnly);
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var requesterId = Guid.NewGuid();
+        _friends.AreFriendsAsync(user.Id, requesterId).Returns(true);
+
+        var result = await _service.GetPublicProfileAsync("testuser", requesterId);
+
+        result.IsSuccess.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task GetPublicProfile_FriendsOnly_NullRequester_Denied()
+    {
+        var user = MakeUser();
+        user.UpdateProfile("Test", null, visibility: ProfileVisibility.FriendsOnly);
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+
+        var result = await _service.GetPublicProfileAsync("testuser", null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.FriendsOnly");
+    }
+
+    [Fact]
+    public async Task GetPublicProfile_Blocked_Returns403()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var requesterId = Guid.NewGuid();
+        _friends.IsBlockedInEitherDirectionAsync(user.Id, requesterId).Returns(true);
+
+        var result = await _service.GetPublicProfileAsync("testuser", requesterId);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.Blocked");
+    }
+
+    [Fact]
+    public async Task BuildProfileDto_IncludesFriendCount()
+    {
+        var user = MakeUser();
+        _users.GetByIdAsync(user.Id).Returns(user);
+        _friends.GetFriendCountAsync(user.Id).Returns(7);
+
+        var result = await _service.GetMyProfileAsync(user.Id);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.FriendCount.Should().Be(7);
+        await _friends.Received(1).GetFriendCountAsync(user.Id);
     }
 
     [Fact]

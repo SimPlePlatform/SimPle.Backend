@@ -554,6 +554,78 @@ public sealed class ProfileEndpointsTests : IDisposable
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
     }
 
+    // ── FriendsOnly & block visibility ───────────────────────────────────────
+
+    [Fact]
+    public async Task GetPublicProfile_FriendsOnlyUser_FriendCanView_Returns200()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+
+        using var friendClient = CreateClient();
+        var (friendEmail, friendUsername) = UniqueUser();
+        await RegisterAndLoginAsync(friendClient, friendEmail, friendUsername);
+
+        // Owner sets visibility to FriendsOnly
+        await ownerClient.PutAsJsonAsync("/api/profile/me", new
+        {
+            DisplayName = "FriendsOnly Owner",
+            Visibility = "FriendsOnly"
+        });
+
+        // Friend sends a request; owner accepts
+        var ownerProfile = await friendClient.GetAsync($"/api/profile/{ownerUsername}");
+        // FriendsOnly is visible in suggestions but the profile page denies strangers — confirm 403 first
+        ownerProfile.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+
+        // Get owner userId from ownerClient (they can always see their own profile)
+        var ownerSelf = await ownerClient.GetAsync("/api/profile/me");
+        var ownerBody = await ownerSelf.Content.ReadAsStringAsync();
+        var ownerJson = System.Text.Json.JsonDocument.Parse(ownerBody);
+        var ownerUserId = ownerJson.RootElement.GetProperty("userId").GetGuid();
+
+        // Friend sends request
+        await friendClient.PostAsJsonAsync("/api/friends/requests", new { TargetUserId = ownerUserId });
+
+        // Owner finds the incoming request and accepts
+        var requestsResp = await ownerClient.GetAsync("/api/friends/requests?direction=incoming");
+        var requestsBody = await requestsResp.Content.ReadAsStringAsync();
+        var requestsJson = System.Text.Json.JsonDocument.Parse(requestsBody);
+        var requestId = requestsJson.RootElement.GetProperty("items")[0].GetProperty("requestId").GetGuid();
+        await ownerClient.PostAsJsonAsync($"/api/friends/requests/{requestId}/accept", (object?)null);
+
+        // Friend can now view the FriendsOnly profile
+        var response = await friendClient.GetAsync($"/api/profile/{ownerUsername}");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain(ownerUsername);
+    }
+
+    [Fact]
+    public async Task GetPublicProfile_BlockedUser_Returns403()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+
+        using var otherClient = CreateClient();
+        var (otherEmail, otherUsername) = UniqueUser();
+        await RegisterAndLoginAsync(otherClient, otherEmail, otherUsername);
+
+        // Owner gets other's userId and blocks them
+        var otherProfile = await ownerClient.GetAsync($"/api/profile/{otherUsername}");
+        var otherJson = System.Text.Json.JsonDocument.Parse(await otherProfile.Content.ReadAsStringAsync());
+        var otherUserId = otherJson.RootElement.GetProperty("userId").GetGuid();
+        await ownerClient.PostAsJsonAsync("/api/friends/blocks", new { TargetUserId = otherUserId });
+
+        // The blocked party tries to view the owner's public profile
+        var response = await otherClient.GetAsync($"/api/profile/{ownerUsername}");
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Profile.Blocked");
+    }
+
     // ── Security regression tests ──────────────────────────────────────────────
 
     [Theory]
