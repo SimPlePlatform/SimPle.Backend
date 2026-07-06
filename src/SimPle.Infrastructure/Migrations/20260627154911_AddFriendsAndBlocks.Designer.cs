@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using SimPle.Infrastructure.Persistence;
@@ -11,9 +12,11 @@ using SimPle.Infrastructure.Persistence;
 namespace SimPle.Infrastructure.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260627154911_AddFriendsAndBlocks")]
+    partial class AddFriendsAndBlocks
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -55,81 +58,17 @@ namespace SimPle.Infrastructure.Migrations
                         });
                 });
 
-            modelBuilder.Entity("SimPle.Domain.Friends.DismissedFriendSuggestion", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTime>("DismissedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTime>("ExpiresAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<Guid>("SuggestedUserId")
-                        .HasColumnType("uuid");
-
-                    b.Property<DateTime>("UpdatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("ExpiresAt")
-                        .HasDatabaseName("ix_dismissed_suggestions_expiresat");
-
-                    b.HasIndex("SuggestedUserId");
-
-                    b.HasIndex("UserId", "SuggestedUserId")
-                        .IsUnique()
-                        .HasDatabaseName("ix_dismissed_suggestions_user_suggested");
-
-                    b.ToTable("dismissed_friend_suggestions", null, t =>
-                        {
-                            t.HasCheckConstraint("ck_no_self_dismissal", "\"UserId\" != \"SuggestedUserId\"");
-                        });
-                });
-
             modelBuilder.Entity("SimPle.Domain.Friends.Friendship", b =>
                 {
                     b.Property<Guid>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uuid");
 
-                    b.Property<DateTime?>("AcceptedAt")
-                        .HasColumnType("timestamp with time zone");
-
                     b.Property<Guid>("AddresseeId")
                         .HasColumnType("uuid");
 
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("timestamp with time zone");
-
-                    b.Property<long>("DomainVersion")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint")
-                        .HasDefaultValue(1L);
-
-                    b.Property<string>("EndReason")
-                        .HasMaxLength(16)
-                        .HasColumnType("character varying(16)");
-
-                    b.Property<DateTime?>("EndedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTime?>("NextRequestAllowedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<int>("RequestCycleId")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("integer")
-                        .HasDefaultValue(1);
 
                     b.Property<Guid>("RequesterId")
                         .HasColumnType("uuid");
@@ -142,9 +81,6 @@ namespace SimPle.Infrastructure.Migrations
                         .HasMaxLength(16)
                         .HasColumnType("character varying(16)");
 
-                    b.Property<Guid?>("TransitionActorId")
-                        .HasColumnType("uuid");
-
                     b.Property<DateTime>("UpdatedAt")
                         .HasColumnType("timestamp with time zone");
 
@@ -156,13 +92,9 @@ namespace SimPle.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("AddresseeId", "Status", "SentAt", "Id")
-                        .IsDescending(false, false, true, true)
-                        .HasDatabaseName("ix_friendships_addressee_status_sentat_id");
+                    b.HasIndex("AddresseeId", "Status");
 
-                    b.HasIndex("RequesterId", "Status", "SentAt", "Id")
-                        .IsDescending(false, false, true, true)
-                        .HasDatabaseName("ix_friendships_requester_status_sentat_id");
+                    b.HasIndex("RequesterId", "Status");
 
                     b.ToTable("friendships", null, t =>
                         {
@@ -196,95 +128,6 @@ namespace SimPle.Infrastructure.Migrations
                         .IsUnique();
 
                     b.ToTable("user_friend_settings", (string)null);
-                });
-
-            modelBuilder.Entity("SimPle.Domain.Outbox.OutboxDelivery", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
-
-                    b.Property<int>("AttemptCount")
-                        .HasColumnType("integer");
-
-                    b.Property<bool>("DeadLettered")
-                        .HasColumnType("boolean");
-
-                    b.Property<Guid>("EventId")
-                        .HasColumnType("uuid");
-
-                    b.Property<string>("HandlerName")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)");
-
-                    b.Property<string>("LastError")
-                        .HasMaxLength(512)
-                        .HasColumnType("character varying(512)");
-
-                    b.Property<DateTime?>("Lease")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<bool>("Processed")
-                        .HasColumnType("boolean");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("EventId", "HandlerName")
-                        .IsUnique()
-                        .HasDatabaseName("ix_outbox_deliveries_event_handler");
-
-                    b.HasIndex("HandlerName", "Processed", "DeadLettered")
-                        .HasDatabaseName("ix_outbox_deliveries_handler_processed_dead");
-
-                    b.ToTable("outbox_deliveries", (string)null);
-                });
-
-            modelBuilder.Entity("SimPle.Domain.Outbox.OutboxMessage", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
-
-                    b.Property<long>("AggregateDomainVersion")
-                        .HasColumnType("bigint");
-
-                    b.Property<Guid>("AggregateId")
-                        .HasColumnType("uuid");
-
-                    b.Property<string>("AggregateType")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<string>("EventType")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<int>("EventVersion")
-                        .HasColumnType("integer");
-
-                    b.Property<DateTime>("OccurredAtUtc")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("Payload")
-                        .IsRequired()
-                        .HasColumnType("jsonb");
-
-                    b.Property<int>("RequestCycleId")
-                        .HasColumnType("integer");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("OccurredAtUtc")
-                        .HasDatabaseName("ix_outbox_messages_occurredat");
-
-                    b.HasIndex("AggregateId", "EventType", "AggregateDomainVersion")
-                        .IsUnique()
-                        .HasDatabaseName("ix_outbox_messages_aggregate_event_version");
-
-                    b.ToTable("outbox_messages", (string)null);
                 });
 
             modelBuilder.Entity("SimPle.Domain.Profiles.ProfileExternalLink", b =>
@@ -743,21 +586,6 @@ namespace SimPle.Infrastructure.Migrations
                         .IsRequired();
                 });
 
-            modelBuilder.Entity("SimPle.Domain.Friends.DismissedFriendSuggestion", b =>
-                {
-                    b.HasOne("SimPle.Domain.Users.User", null)
-                        .WithMany()
-                        .HasForeignKey("SuggestedUserId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-
-                    b.HasOne("SimPle.Domain.Users.User", null)
-                        .WithMany()
-                        .HasForeignKey("UserId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-                });
-
             modelBuilder.Entity("SimPle.Domain.Friends.Friendship", b =>
                 {
                     b.HasOne("SimPle.Domain.Users.User", null)
@@ -778,15 +606,6 @@ namespace SimPle.Infrastructure.Migrations
                     b.HasOne("SimPle.Domain.Users.User", null)
                         .WithMany()
                         .HasForeignKey("UserId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-                });
-
-            modelBuilder.Entity("SimPle.Domain.Outbox.OutboxDelivery", b =>
-                {
-                    b.HasOne("SimPle.Domain.Outbox.OutboxMessage", null)
-                        .WithMany()
-                        .HasForeignKey("EventId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });
