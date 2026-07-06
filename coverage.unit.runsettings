@@ -12,7 +12,6 @@
             [SimPle.Infrastructure]SimPle.Infrastructure.DependencyInjection,
             [SimPle.Application]SimPle.Application.DependencyInjection,
             [SimPle.Domain]SimPle.Domain.Chat.*,
-            [SimPle.Domain]SimPle.Domain.Friends.*,
             [SimPle.Domain]SimPle.Domain.GameHost.*,
             [SimPle.Domain]SimPle.Domain.Games.*,
             [SimPle.Domain]SimPle.Domain.Hardware.*,
