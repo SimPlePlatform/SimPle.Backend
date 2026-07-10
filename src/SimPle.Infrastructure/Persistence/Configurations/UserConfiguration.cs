@@ -42,5 +42,11 @@ public sealed class UserConfiguration : IEntityTypeConfiguration<User>
         builder.HasIndex(u => u.NormalizedUsername).IsUnique();
         // Sparse unique index: multiple users may have null GoogleId, but non-null values must be unique.
         builder.HasIndex(u => u.GoogleId).IsUnique().HasFilter("\"GoogleId\" IS NOT NULL");
+
+        // NOTE: People-search prefix (LIKE 'X%') performance relies on two additional text_pattern_ops
+        // indexes EF's fluent API cannot express — a plain btree index does not accelerate pattern-match
+        // prefix scans under a non-C collation. Created via raw SQL in migration
+        // 20260709120000_AddPeopleSearchAndSendCap: ix_users_normalizedusername_pattern (NormalizedUsername)
+        // and ix_users_displayname_upper_pattern (expression index on upper("DisplayName")).
     }
 }

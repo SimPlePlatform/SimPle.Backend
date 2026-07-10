@@ -344,7 +344,7 @@ public sealed class ProfileEndpointsTests : IDisposable
     }
 
     [Fact]
-    public async Task GetPublicProfile_PrivateUser_Returns403ForOthers()
+    public async Task GetPublicProfile_PrivateUser_Returns404ForOthers()
     {
         // Register user and set profile to private.
         using var ownerClient = CreateClient();
@@ -360,11 +360,13 @@ public sealed class ProfileEndpointsTests : IDisposable
         using var otherClient = CreateClient();
         var response = await otherClient.GetAsync($"/api/profile/{username}");
 
-        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Profile.NotVisible");
     }
 
     [Fact]
-    public async Task GetPublicProfile_FriendsOnlyUser_Returns403ForOthers()
+    public async Task GetPublicProfile_FriendsOnlyUser_Returns404ForOthers()
     {
         using var ownerClient = CreateClient();
         var (email, username) = UniqueUser();
@@ -378,7 +380,9 @@ public sealed class ProfileEndpointsTests : IDisposable
         using var otherClient = CreateClient();
         var response = await otherClient.GetAsync($"/api/profile/{username}");
 
-        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Profile.NotVisible");
     }
 
     [Fact]
@@ -406,6 +410,121 @@ public sealed class ProfileEndpointsTests : IDisposable
         var response = await client.GetAsync("/api/profile/definitelynotauser99xyz");
 
         response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    // ── /api/profile/{username}/viewer-context ──────────────────────────────────
+
+    [Fact]
+    public async Task GetViewerContext_Unauthenticated_Returns401()
+    {
+        using var ownerClient = CreateClient();
+        var (email, username) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, email, username);
+
+        using var anonClient = CreateClient();
+        var response = await anonClient.GetAsync($"/api/profile/{username}/viewer-context");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+    }
+
+    [Fact]
+    public async Task GetViewerContext_Self_ReturnsSelfState()
+    {
+        using var client = CreateClient();
+        var (email, username) = UniqueUser();
+        await RegisterAndLoginAsync(client, email, username);
+
+        var response = await client.GetAsync($"/api/profile/{username}/viewer-context");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("\"relationshipState\":\"Self\"");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_Stranger_ReturnsNoneState()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+
+        using var otherClient = CreateClient();
+        var (otherEmail, otherUsername) = UniqueUser();
+        await RegisterAndLoginAsync(otherClient, otherEmail, otherUsername);
+
+        var response = await otherClient.GetAsync($"/api/profile/{ownerUsername}/viewer-context");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("\"relationshipState\":\"None\"");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_UnknownUsername_Returns404NotVisible()
+    {
+        using var client = CreateClient();
+        var (email, username) = UniqueUser();
+        await RegisterAndLoginAsync(client, email, username);
+
+        var response = await client.GetAsync("/api/profile/definitelynotauser99xyz/viewer-context");
+
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_ViewerBlockedTarget_ReturnsBlockedBySelf_BypassingPrivateVisibility()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+        await ownerClient.PutAsJsonAsync("/api/profile/me", new
+        {
+            DisplayName = "Private Owner",
+            Visibility = "Private"
+        });
+        var ownerSelf = await ownerClient.GetAsync("/api/profile/me");
+        var ownerJson = System.Text.Json.JsonDocument.Parse(await ownerSelf.Content.ReadAsStringAsync());
+        var ownerUserId = ownerJson.RootElement.GetProperty("userId").GetGuid();
+
+        using var otherClient = CreateClient();
+        var (otherEmail, otherUsername) = UniqueUser();
+        await RegisterAndLoginAsync(otherClient, otherEmail, otherUsername);
+        await otherClient.PostAsJsonAsync("/api/friends/blocks", new { TargetUserId = ownerUserId });
+
+        // The blocker can still resolve a viewer-context for the private target they blocked,
+        // bypassing the target's own Private visibility, so the UI can offer "unblock".
+        var response = await otherClient.GetAsync($"/api/profile/{ownerUsername}/viewer-context");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("\"relationshipState\":\"BlockedBySelf\"");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_BlockedByTarget_Returns404NotVisible()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+
+        using var otherClient = CreateClient();
+        var (otherEmail, otherUsername) = UniqueUser();
+        await RegisterAndLoginAsync(otherClient, otherEmail, otherUsername);
+        var otherSelf = await otherClient.GetAsync("/api/profile/me");
+        var otherJson = System.Text.Json.JsonDocument.Parse(await otherSelf.Content.ReadAsStringAsync());
+        var otherUserId = otherJson.RootElement.GetProperty("userId").GetGuid();
+
+        // Owner blocks the other user; from the other user's viewpoint this is BlockedByTarget,
+        // which must never surface — it collapses to the same 404 as a nonexistent profile.
+        await ownerClient.PostAsJsonAsync("/api/friends/blocks", new { TargetUserId = otherUserId });
+
+        var response = await otherClient.GetAsync($"/api/profile/{ownerUsername}/viewer-context");
+
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Profile.NotVisible");
     }
 
     // ── Username update ───────────────────────────────────────────────────────
@@ -576,8 +695,8 @@ public sealed class ProfileEndpointsTests : IDisposable
 
         // Friend sends a request; owner accepts
         var ownerProfile = await friendClient.GetAsync($"/api/profile/{ownerUsername}");
-        // FriendsOnly is visible in suggestions but the profile page denies strangers — confirm 403 first
-        ownerProfile.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        // FriendsOnly is visible in suggestions but the profile page denies strangers — confirm 404 first
+        ownerProfile.StatusCode.Should().Be(HttpStatusCode.NotFound);
 
         // Get owner userId from ownerClient (they can always see their own profile)
         var ownerSelf = await ownerClient.GetAsync("/api/profile/me");
@@ -603,7 +722,7 @@ public sealed class ProfileEndpointsTests : IDisposable
     }
 
     [Fact]
-    public async Task GetPublicProfile_BlockedUser_Returns403()
+    public async Task GetPublicProfile_BlockedUser_Returns404()
     {
         using var ownerClient = CreateClient();
         var (ownerEmail, ownerUsername) = UniqueUser();
@@ -621,9 +740,9 @@ public sealed class ProfileEndpointsTests : IDisposable
 
         // The blocked party tries to view the owner's public profile
         var response = await otherClient.GetAsync($"/api/profile/{ownerUsername}");
-        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
         var body = await response.Content.ReadAsStringAsync();
-        body.Should().Contain("Profile.Blocked");
+        body.Should().Contain("Profile.NotVisible");
     }
 
     // ── Security regression tests ──────────────────────────────────────────────
@@ -805,6 +924,185 @@ public sealed class ProfileEndpointsTests : IDisposable
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
     }
 
+    // ── /api/profile/{username}/friends & /mutual-friends (Module 3 2B) ──────
+
+    [Fact]
+    public async Task GetFriends_AnonymousDefaultVisibility_Returns404NotVisible()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+        await ownerClient.PutAsJsonAsync("/api/profile/me", new { DisplayName = "Owner", Visibility = "Public" });
+
+        using var anonClient = CreateClient();
+        var response = await anonClient.GetAsync($"/api/profile/{ownerUsername}/friends");
+
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetFriends_AnonymousPublicEveryoneListVisibility_Returns200()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+        await ownerClient.PutAsJsonAsync("/api/profile/me", new { DisplayName = "Owner", Visibility = "Public" });
+        await ownerClient.PutAsJsonAsync("/api/friends/settings",
+            new { FriendRequestPrivacy = "Anyone", FriendsListVisibility = "Everyone" });
+
+        using var anonClient = CreateClient();
+        var response = await anonClient.GetAsync($"/api/profile/{ownerUsername}/friends");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task GetFriends_Self_ReturnsOwnFriendsRegardlessOfSetting()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+        await ownerClient.PutAsJsonAsync("/api/friends/settings",
+            new { FriendRequestPrivacy = "Anyone", FriendsListVisibility = "OnlyMe" });
+
+        var response = await ownerClient.GetAsync($"/api/profile/{ownerUsername}/friends");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task GetFriends_AuthenticatedFriend_ReturnsPageContainingFriend()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+
+        using var friendClient = CreateClient();
+        var (friendEmail, friendUsername) = UniqueUser();
+        await RegisterAndLoginAsync(friendClient, friendEmail, friendUsername);
+
+        await BefriendAsync(ownerClient, friendClient, friendUsername);
+
+        var response = await friendClient.GetAsync($"/api/profile/{ownerUsername}/friends");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain(friendUsername);
+    }
+
+    [Fact]
+    public async Task GetFriends_AuthenticatedNonFriendDefaultVisibility_Returns404NotVisible()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+
+        using var otherClient = CreateClient();
+        var (otherEmail, otherUsername) = UniqueUser();
+        await RegisterAndLoginAsync(otherClient, otherEmail, otherUsername);
+
+        var response = await otherClient.GetAsync($"/api/profile/{ownerUsername}/friends");
+
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetFriends_InvalidCursor_Returns400InvalidCursor()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+
+        var response = await ownerClient.GetAsync($"/api/profile/{ownerUsername}/friends?cursor=@@bad@@");
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Pagination.InvalidCursor");
+    }
+
+    [Fact]
+    public async Task GetMutualFriends_Unauthenticated_Returns401()
+    {
+        using var ownerClient = CreateClient();
+        var (ownerEmail, ownerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(ownerClient, ownerEmail, ownerUsername);
+
+        using var anonClient = CreateClient();
+        var response = await anonClient.GetAsync($"/api/profile/{ownerUsername}/mutual-friends");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+    }
+
+    [Fact]
+    public async Task GetMutualFriends_NonFriendDefaultVisibility_Returns404NotVisible()
+    {
+        using var viewerClient = CreateClient();
+        var (viewerEmail, viewerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(viewerClient, viewerEmail, viewerUsername);
+
+        using var targetClient = CreateClient();
+        var (targetEmail, targetUsername) = UniqueUser();
+        await RegisterAndLoginAsync(targetClient, targetEmail, targetUsername);
+
+        var response = await viewerClient.GetAsync($"/api/profile/{targetUsername}/mutual-friends");
+
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetMutualFriends_EveryoneVisibility_ReturnsSharedFriend()
+    {
+        using var viewerClient = CreateClient();
+        var (viewerEmail, viewerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(viewerClient, viewerEmail, viewerUsername);
+
+        using var targetClient = CreateClient();
+        var (targetEmail, targetUsername) = UniqueUser();
+        await RegisterAndLoginAsync(targetClient, targetEmail, targetUsername);
+        await targetClient.PutAsJsonAsync("/api/friends/settings",
+            new { FriendRequestPrivacy = "Anyone", FriendsListVisibility = "Everyone" });
+
+        using var mutualClient = CreateClient();
+        var (mutualEmail, mutualUsername) = UniqueUser();
+        await RegisterAndLoginAsync(mutualClient, mutualEmail, mutualUsername);
+
+        // mutualClient is friends with both the viewer and the target, so it is their one shared friend.
+        await BefriendAsync(viewerClient, mutualClient, mutualUsername);
+        await BefriendAsync(targetClient, mutualClient, mutualUsername);
+
+        var response = await viewerClient.GetAsync($"/api/profile/{targetUsername}/mutual-friends");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain(mutualUsername);
+    }
+
+    [Fact]
+    public async Task GetMutualFriends_InvalidCursor_Returns400InvalidCursor()
+    {
+        using var viewerClient = CreateClient();
+        var (viewerEmail, viewerUsername) = UniqueUser();
+        await RegisterAndLoginAsync(viewerClient, viewerEmail, viewerUsername);
+
+        using var targetClient = CreateClient();
+        var (targetEmail, targetUsername) = UniqueUser();
+        await RegisterAndLoginAsync(targetClient, targetEmail, targetUsername);
+        await targetClient.PutAsJsonAsync("/api/friends/settings",
+            new { FriendRequestPrivacy = "Anyone", FriendsListVisibility = "Everyone" });
+
+        var response = await viewerClient.GetAsync($"/api/profile/{targetUsername}/mutual-friends?cursor=@@bad@@");
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("Pagination.InvalidCursor");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static (string email, string username) UniqueUser()
@@ -856,6 +1154,22 @@ public sealed class ProfileEndpointsTests : IDisposable
     }
 
     private sealed record UploadUrlResponse(string ObjectKey);
+
+    /// Sends a friend request from requesterClient to the user with addresseeUsername, then accepts it
+    /// from addresseeClient, leaving the two accounts as accepted friends.
+    private static async Task BefriendAsync(HttpClient requesterClient, HttpClient addresseeClient, string addresseeUsername)
+    {
+        var targetProfile = await requesterClient.GetAsync($"/api/profile/{addresseeUsername}");
+        var targetJson = System.Text.Json.JsonDocument.Parse(await targetProfile.Content.ReadAsStringAsync());
+        var targetId = targetJson.RootElement.GetProperty("userId").GetGuid();
+
+        await requesterClient.PostAsJsonAsync("/api/friends/requests", new { TargetUserId = targetId });
+
+        var requestsResp = await addresseeClient.GetAsync("/api/friends/requests?direction=incoming");
+        var requestsJson = System.Text.Json.JsonDocument.Parse(await requestsResp.Content.ReadAsStringAsync());
+        var requestId = requestsJson.RootElement.GetProperty("items")[0].GetProperty("requestId").GetGuid();
+        await addresseeClient.PostAsJsonAsync($"/api/friends/requests/{requestId}/accept", (object?)null);
+    }
 
     public void Dispose() => _factory.Dispose();
 }
