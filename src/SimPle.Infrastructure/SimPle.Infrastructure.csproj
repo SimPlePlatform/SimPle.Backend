@@ -7,6 +7,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Games\catalog.seed.v1.json" />
+    <EmbeddedResource Include="Games\catalog.seed.schema.json" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="AWSSDK.S3" Version="3.7.412.5" />
     <PackageReference Include="Google.Apis.Auth" Version="1.68.0" />
     <PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />

@@ -41,6 +41,7 @@ public static class DependencyInjection
         services.AddScoped<IUsernameChangeRequestRepository, UsernameChangeRequestRepository>();
         services.AddScoped<IRetiredUsernameRepository, RetiredUsernameRepository>();
         services.AddScoped<IFriendRepository, FriendRepository>();
+        services.AddScoped<IGameRepository, GameRepository>();
         services.Configure<StorageOptions>(configuration.GetSection(StorageOptions.SectionName));
         services.PostConfigure<StorageOptions>(options =>
         {
