@@ -13,6 +13,11 @@ public sealed class UserFriendSettingsConfiguration : IEntityTypeConfiguration<U
         builder.HasKey(s => s.Id);
         builder.Property(s => s.FriendRequestPrivacy)
             .HasConversion<string>().HasMaxLength(24).IsRequired();
+        builder.Property(s => s.SearchVisibility)
+            .HasConversion<string>().HasMaxLength(24).IsRequired();
+        builder.Property(s => s.FriendsListVisibility)
+            .HasConversion<string>().HasMaxLength(24).IsRequired();
+        builder.Property(s => s.PrivacyPolicyVersion).IsRequired();
         builder.HasIndex(s => s.UserId).IsUnique();
         builder.HasOne<User>().WithMany().HasForeignKey(s => s.UserId).OnDelete(DeleteBehavior.Cascade);
     }

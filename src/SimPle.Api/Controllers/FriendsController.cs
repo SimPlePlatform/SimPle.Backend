@@ -334,7 +334,8 @@ public sealed class FriendsController : ControllerBase
         if (!validation.IsValid)
             return BadRequest(Error("Validation.Failed", validation.Errors.First().ErrorMessage));
 
-        var result = await _friends.UpdateSettingsAsync(userId, request.FriendRequestPrivacy, ct);
+        var result = await _friends.UpdateSettingsAsync(
+            userId, request.FriendRequestPrivacy, request.SearchVisibility, request.FriendsListVisibility, ct);
         return result.IsSuccess ? Ok(result.Value) : MapError(result.Error!);
     }
 
@@ -379,6 +380,14 @@ public sealed class FriendsController : ControllerBase
                     Response.Headers.RetryAfter = seconds.ToString();
                 }
                 return Conflict(body);
+
+            case "Friends.SendCapExceeded":
+                if (error.RetryAfterUtc is DateTime capUntil)
+                {
+                    var capSeconds = Math.Max(0, (int)Math.Ceiling((capUntil - DateTime.UtcNow).TotalSeconds));
+                    Response.Headers.RetryAfter = capSeconds.ToString();
+                }
+                return StatusCode(StatusCodes.Status429TooManyRequests, body);
 
             case "Friends.AlreadyFriends":
             case "Friends.ConcurrencyConflict":

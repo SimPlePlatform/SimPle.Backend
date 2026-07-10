@@ -368,4 +368,128 @@ public sealed class FriendsPostgresConcurrencyTests : IAsyncLifetime
         Assert.Contains("ix_friendships_addressee_status_sentat_id", planText);
         Assert.DoesNotContain("Seq Scan", planText);
     }
+
+    // ── EXPLAIN: people-search prefix indexes (username / display-name pattern ops) ──
+
+    [SkippableFact]
+    public async Task Explain_PeopleSearchUsernamePrefix_UsesPatternIndex()
+    {
+        SkipIfNoPg();
+        var users = await SeedUsersAsync(6);
+
+        await using var conn = new NpgsqlConnection(_testConn);
+        await conn.OpenAsync();
+
+        await using (var setCmd = conn.CreateCommand())
+        {
+            setCmd.CommandText = "SET enable_seqscan = off;";
+            await setCmd.ExecuteNonQueryAsync();
+        }
+
+        // Mirrors the translated NormalizedUsername.StartsWith(...) predicate from FriendRepository.SearchPeopleAsync.
+        await using var explain = conn.CreateCommand();
+        explain.CommandText = """
+            EXPLAIN (FORMAT TEXT)
+            SELECT "Id", "NormalizedUsername"
+            FROM users
+            WHERE "NormalizedUsername" LIKE @prefix || '%';
+            """;
+        explain.Parameters.AddWithValue("prefix", users[0].NormalizedUsername[..3]);
+
+        var plan = new System.Text.StringBuilder();
+        await using (var reader = await explain.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                plan.AppendLine(reader.GetString(0));
+
+        var planText = plan.ToString();
+        Assert.Contains("ix_users_normalizedusername_pattern", planText);
+        Assert.DoesNotContain("Seq Scan", planText);
+    }
+
+    [SkippableFact]
+    public async Task Explain_PeopleSearchDisplayNamePrefix_UsesPatternIndex()
+    {
+        SkipIfNoPg();
+        var users = await SeedUsersAsync(6);
+
+        await using var conn = new NpgsqlConnection(_testConn);
+        await conn.OpenAsync();
+
+        await using (var setCmd = conn.CreateCommand())
+        {
+            setCmd.CommandText = "SET enable_seqscan = off;";
+            await setCmd.ExecuteNonQueryAsync();
+        }
+
+        // Mirrors the translated DisplayName.ToUpper().StartsWith(...) predicate.
+        await using var explain = conn.CreateCommand();
+        explain.CommandText = """
+            EXPLAIN (FORMAT TEXT)
+            SELECT "Id", "DisplayName"
+            FROM users
+            WHERE upper("DisplayName") LIKE @prefix || '%';
+            """;
+        explain.Parameters.AddWithValue("prefix", "PG");
+
+        var plan = new System.Text.StringBuilder();
+        await using (var reader = await explain.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                plan.AppendLine(reader.GetString(0));
+
+        var planText = plan.ToString();
+        Assert.Contains("ix_users_displayname_upper_pattern", planText);
+        Assert.DoesNotContain("Seq Scan", planText);
+    }
+
+    // ── EXPLAIN: correlated mutual-count subquery shape uses friendship indexes (no N+1 seq scan) ──
+
+    [SkippableFact]
+    public async Task Explain_MutualCountSubqueryShape_UsesFriendshipIndexes_NoSeqScan()
+    {
+        SkipIfNoPg();
+        var users = await SeedUsersAsync(6);
+        await using (var seed = CreateTestDb())
+        {
+            for (var i = 1; i < users.Length; i++)
+            {
+                var f = Friendship.Request(users[0].Id, users[i].Id);
+                f.Accept(users[i].Id);
+                seed.Friendships.Add(f);
+            }
+            await seed.SaveChangesAsync();
+        }
+
+        await using var conn = new NpgsqlConnection(_testConn);
+        await conn.OpenAsync();
+
+        await using (var setCmd = conn.CreateCommand())
+        {
+            setCmd.CommandText = "SET enable_seqscan = off;";
+            await setCmd.ExecuteNonQueryAsync();
+        }
+
+        // Mirrors the correlated MutualCount subquery shape in FriendRepository.SearchPeopleAsync — proves the
+        // (RequesterId,Status,...) / (AddresseeId,Status,...) composite indexes are used per-candidate rather
+        // than a full scan of friendships.
+        await using var explain = conn.CreateCommand();
+        explain.CommandText = """
+            EXPLAIN (FORMAT TEXT)
+            SELECT COUNT(*)
+            FROM friendships
+            WHERE "Status" = 'Accepted' AND ("RequesterId" = @candidate OR "AddresseeId" = @candidate);
+            """;
+        explain.Parameters.AddWithValue("candidate", users[1].Id);
+
+        var plan = new System.Text.StringBuilder();
+        await using (var reader = await explain.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                plan.AppendLine(reader.GetString(0));
+
+        var planText = plan.ToString();
+        Assert.True(
+            planText.Contains("ix_friendships_requester_status_sentat_id") ||
+            planText.Contains("ix_friendships_addressee_status_sentat_id"),
+            $"Expected an index scan on one of the friendships composite indexes, got:\n{planText}");
+        Assert.DoesNotContain("Seq Scan", planText);
+    }
 }

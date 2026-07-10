@@ -19,6 +19,7 @@ public class AppDbContext : DbContext
     public DbSet<ProfileExternalLink> ProfileExternalLinks => Set<ProfileExternalLink>();
     public DbSet<ProfileInterestTag> ProfileInterestTags => Set<ProfileInterestTag>();
     public DbSet<UsernameChangeRequest> UsernameChangeRequests => Set<UsernameChangeRequest>();
+    public DbSet<RetiredUsername> RetiredUsernames => Set<RetiredUsername>();
 
     // Module 3 — friends & social graph
     public DbSet<Friendship> Friendships => Set<Friendship>();

@@ -50,5 +50,6 @@ public interface IFriendsService
         Guid actorId, CancellationToken ct = default);
 
     Task<Result<FriendSettingsDto>> UpdateSettingsAsync(
-        Guid actorId, string friendRequestPrivacy, CancellationToken ct = default);
+        Guid actorId, string friendRequestPrivacy, string? searchVisibility, string? friendsListVisibility,
+        CancellationToken ct = default);
 }

@@ -39,6 +39,7 @@ public static class DependencyInjection
         services.AddScoped<IGoogleTokenValidationService, GoogleTokenValidationService>();
         services.AddScoped<IProfileRepository, ProfileRepository>();
         services.AddScoped<IUsernameChangeRequestRepository, UsernameChangeRequestRepository>();
+        services.AddScoped<IRetiredUsernameRepository, RetiredUsernameRepository>();
         services.AddScoped<IFriendRepository, FriendRepository>();
         services.Configure<StorageOptions>(configuration.GetSection(StorageOptions.SectionName));
         services.PostConfigure<StorageOptions>(options =>

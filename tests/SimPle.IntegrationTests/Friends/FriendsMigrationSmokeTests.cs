@@ -104,6 +104,43 @@ public sealed class FriendsMigrationSmokeTests : IAsyncLifetime
         }
     }
 
+    [SkippableFact]
+    public async Task Migration_AddsSendCapColumnsToFriendships()
+    {
+        SkipIfNoPg();
+
+        await using var conn = new NpgsqlConnection(_testConn);
+        await conn.OpenAsync();
+
+        foreach (var column in new[] { "LastSenderId", "SendCountInWindow", "SendWindowStartUtc" })
+        {
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_name = 'friendships' AND column_name = @c
+                """;
+            cmd.Parameters.AddWithValue("c", column);
+            Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Migration_AddsPeopleSearchPrefixIndexes()
+    {
+        SkipIfNoPg();
+
+        await using var conn = new NpgsqlConnection(_testConn);
+        await conn.OpenAsync();
+
+        foreach (var index in new[] { "ix_users_normalizedusername_pattern", "ix_users_displayname_upper_pattern" })
+        {
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM pg_indexes WHERE tablename = 'users' AND indexname = @i";
+            cmd.Parameters.AddWithValue("i", index);
+            Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+        }
+    }
+
     // ── Unordered-pair uniqueness ─────────────────────────────────────────────
 
     [SkippableFact]
@@ -431,15 +468,15 @@ public sealed class FriendsMigrationSmokeTests : IAsyncLifetime
         db.Friendships.Add(f2);
 
         var sOff = UserFriendSettings.CreateDefault(off.Id);
-        sOff.UpdatePrivacy(FriendRequestPrivacy.Off);
+        sOff.UpdateSettings(FriendRequestPrivacy.Off, null, null);
         db.UserFriendSettings.Add(sOff);
 
         var sFofNo = UserFriendSettings.CreateDefault(fofNoMutual.Id);
-        sFofNo.UpdatePrivacy(FriendRequestPrivacy.FriendsOfFriends);
+        sFofNo.UpdateSettings(FriendRequestPrivacy.FriendsOfFriends, null, null);
         db.UserFriendSettings.Add(sFofNo);
 
         var sFofWith = UserFriendSettings.CreateDefault(fofWithMutual.Id);
-        sFofWith.UpdatePrivacy(FriendRequestPrivacy.FriendsOfFriends);
+        sFofWith.UpdateSettings(FriendRequestPrivacy.FriendsOfFriends, null, null);
         db.UserFriendSettings.Add(sFofWith);
 
         await db.SaveChangesAsync();
@@ -462,5 +499,67 @@ public sealed class FriendsMigrationSmokeTests : IAsyncLifetime
 
         // Already actor's friend → excluded from suggestions
         Assert.DoesNotContain(suggestions, s => s.user.Id == mutual.Id);
+    }
+
+    [SkippableFact]
+    public async Task Repository_SearchPeopleAsync_TranslatesSuccessfully()
+    {
+        SkipIfNoPg();
+
+        var users = await SeedUsersAsync(2);
+        await using var db = CreateTestDb();
+
+        var repo = new FriendRepository(db);
+        // The correlated MutualCount subquery (flagged as a translation risk in the reconciliation doc) must
+        // fully server-translate against real Postgres; a client-eval fallback would throw here.
+        var result = await repo.SearchPeopleAsync(users[0].Id, users[1].NormalizedUsername, 20, null, null, null);
+
+        Assert.Single(result);
+        Assert.Equal(users[1].Id, result[0].user.Id);
+    }
+
+    [SkippableFact]
+    public async Task Repository_GetVisibleFriendsPageAsync_TranslatesSuccessfully()
+    {
+        SkipIfNoPg();
+
+        var users = await SeedUsersAsync(2);
+        await using var db = CreateTestDb();
+
+        var friendship = Friendship.Request(users[0].Id, users[1].Id);
+        friendship.Accept(users[1].Id);
+        db.Friendships.Add(friendship);
+        await db.SaveChangesAsync();
+
+        var repo = new FriendRepository(db);
+        var result = await repo.GetVisibleFriendsPageAsync(users[0].Id, users[1].Id, null, 20, null, null);
+
+        Assert.Single(result);
+        Assert.Equal(users[1].Id, result[0].Id);
+    }
+
+    [SkippableFact]
+    public async Task Repository_GetVisibleMutualFriendsPageAsync_TranslatesSuccessfully()
+    {
+        SkipIfNoPg();
+
+        var users = await SeedUsersAsync(3); // [0]=viewer, [1]=target, [2]=shared friend
+        await using var db = CreateTestDb();
+
+        var f1 = Friendship.Request(users[0].Id, users[2].Id);
+        f1.Accept(users[2].Id);
+        db.Friendships.Add(f1);
+
+        var f2 = Friendship.Request(users[1].Id, users[2].Id);
+        f2.Accept(users[2].Id);
+        db.Friendships.Add(f2);
+
+        await db.SaveChangesAsync();
+
+        var repo = new FriendRepository(db);
+        var result = await repo.GetVisibleMutualFriendsPageAsync(users[0].Id, users[1].Id, 20, null, null);
+
+        Assert.Single(result);
+        Assert.Equal(users[2].Id, result[0].Id);
     }
 }

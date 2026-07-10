@@ -24,6 +24,11 @@ public sealed class FriendsService : IFriendsService
     private static readonly TimeSpan CancelCooldown = TimeSpan.FromHours(24);
     private static readonly TimeSpan DismissalWindow = TimeSpan.FromDays(30);
 
+    // Abuse cap (spec-r2 risk #12): a directional account-target send cap, independent of the cooldowns
+    // above — a defense-in-depth ceiling on repeated sends to the same target within a rolling day.
+    private static readonly TimeSpan SendCapWindow = TimeSpan.FromDays(1);
+    private const int SendCapMax = 3;
+
     private const int DefaultLimit = 20;
     private const int MaxLimit = 50;
     private const int MaxConvergeAttempts = 3;
@@ -37,6 +42,7 @@ public sealed class FriendsService : IFriendsService
     private const string RequestCooldown = "Friends.RequestCooldown";
     private const string AlreadyFriends = "Friends.AlreadyFriends";
     private const string ConcurrencyConflict = "Friends.ConcurrencyConflict";
+    private const string SendCapExceeded = "Friends.SendCapExceeded";
     private const string NotVisibleCode = "Profile.NotVisible";
     private const string InvalidCursor = "Pagination.InvalidCursor";
     private const string ValidationFailed = "Validation.Failed";
@@ -203,6 +209,7 @@ public sealed class FriendsService : IFriendsService
             if (edge is null)
             {
                 var created = Friendship.Request(actorId, targetUserId);
+                created.RecordSend(actorId, DateTime.UtcNow, SendCapWindow);
                 var add = await _friends.TryAddFriendshipAsync(created, FriendOutbox.RequestCreatedEvent(created), ct);
                 if (add == AddFriendshipOutcome.Conflict) continue;   // racing insert won → re-read + converge
                 _logger.LogInformation("Security: Friend request sent. ActorId={ActorId} TargetId={TargetId}", actorId, targetUserId);
@@ -232,7 +239,14 @@ public sealed class FriendsService : IFriendsService
                             new Error(RequestCooldown, "You must wait before sending another request to this user.")
                             { RetryAfterUtc = until });
 
+                    var now = DateTime.UtcNow;
+                    if (!edge.CanSend(actorId, now, SendCapMax, SendCapWindow))
+                        return Result<SendFriendRequestResult>.Fail(
+                            new Error(SendCapExceeded, "You have sent too many requests to this user today.")
+                            { RetryAfterUtc = edge.SendRetryAfterUtc(SendCapWindow) });
+
                     edge.Reactivate(actorId, targetUserId);
+                    edge.RecordSend(actorId, now, SendCapWindow);
                     var reactivated = await _friends.TryUpdateFriendshipAsync(edge, FriendOutbox.RequestCreatedEvent(edge), ct);
                     if (reactivated == UpdateFriendshipOutcome.ConcurrencyConflict) continue;
                     _logger.LogInformation("Security: Friend request sent. ActorId={ActorId} TargetId={TargetId}", actorId, targetUserId);
@@ -473,18 +487,40 @@ public sealed class FriendsService : IFriendsService
     {
         var settings = await _friends.GetSettingsAsync(actorId, ct);
         var privacy = settings?.FriendRequestPrivacy ?? FriendRequestPrivacy.Anyone;
-        return Result<FriendSettingsDto>.Ok(new FriendSettingsDto(privacy.ToString()));
+        var search = settings?.SearchVisibility ?? SearchVisibility.Everyone;
+        var friendsList = settings?.FriendsListVisibility ?? FriendsListVisibility.Friends;
+        return Result<FriendSettingsDto>.Ok(new FriendSettingsDto(privacy.ToString(), search.ToString(), friendsList.ToString()));
     }
 
     public async Task<Result<FriendSettingsDto>> UpdateSettingsAsync(
-        Guid actorId, string friendRequestPrivacy, CancellationToken ct = default)
+        Guid actorId, string friendRequestPrivacy, string? searchVisibility, string? friendsListVisibility,
+        CancellationToken ct = default)
     {
         if (!Enum.TryParse<FriendRequestPrivacy>(friendRequestPrivacy, ignoreCase: true, out var privacy))
             return Result<FriendSettingsDto>.Fail(
                 ValidationFailed, "FriendRequestPrivacy must be one of: Anyone, FriendsOfFriends, Off.");
 
-        await _friends.UpsertSettingsAsync(actorId, privacy, ct);
-        return Result<FriendSettingsDto>.Ok(new FriendSettingsDto(privacy.ToString()));
+        SearchVisibility? search = null;
+        if (searchVisibility is not null)
+        {
+            if (!Enum.TryParse<SearchVisibility>(searchVisibility, ignoreCase: true, out var parsedSearch))
+                return Result<FriendSettingsDto>.Fail(
+                    ValidationFailed, "SearchVisibility must be one of: Everyone, FriendsOfFriends, Nobody.");
+            search = parsedSearch;
+        }
+
+        FriendsListVisibility? friendsList = null;
+        if (friendsListVisibility is not null)
+        {
+            if (!Enum.TryParse<FriendsListVisibility>(friendsListVisibility, ignoreCase: true, out var parsedList))
+                return Result<FriendSettingsDto>.Fail(
+                    ValidationFailed, "FriendsListVisibility must be one of: Everyone, Friends, OnlyMe.");
+            friendsList = parsedList;
+        }
+
+        var updated = await _friends.UpsertSettingsAsync(actorId, privacy, search, friendsList, ct);
+        return Result<FriendSettingsDto>.Ok(new FriendSettingsDto(
+            updated.FriendRequestPrivacy.ToString(), updated.SearchVisibility.ToString(), updated.FriendsListVisibility.ToString()));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -27,6 +27,11 @@ public sealed class FriendshipConfiguration : IEntityTypeConfiguration<Friendshi
         builder.Property(f => f.DomainVersion).IsRequired().HasDefaultValue(1L);
         builder.Property(f => f.RequestCycleId).IsRequired().HasDefaultValue(1);
 
+        // Directional account-target send-abuse cap bookkeeping (spec-r2 risk #12); server-owned only.
+        builder.Property(f => f.LastSenderId);
+        builder.Property(f => f.SendCountInWindow).IsRequired().HasDefaultValue(0);
+        builder.Property(f => f.SendWindowStartUtc);
+
         // Npgsql row-version pattern: uint property mapped to xmin (optimistic concurrency token).
         builder.Property(f => f.Version).IsRowVersion();
 

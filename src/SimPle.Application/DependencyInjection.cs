@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using SimPle.Application.Auth.Services;
 using SimPle.Application.Friends.Services;
+using SimPle.Application.People.Services;
 using SimPle.Application.Profiles.Services;
 
 namespace SimPle.Application;
@@ -12,6 +13,7 @@ public static class DependencyInjection
         services.AddScoped<IAuthService, AuthService>();
         services.AddScoped<IProfileService, ProfileService>();
         services.AddScoped<IFriendsService, FriendsService>();
+        services.AddScoped<IPeopleService, PeopleService>();
 
         return services;
     }

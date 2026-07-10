@@ -49,6 +49,64 @@ public static class Cursor
         return true;
     }
 
+    // ── People-search cursor: (bucket, normalizedSortKey, Guid) position, bound to (normalizedQuery,
+    // rankingVersion) so a cursor cannot be replayed against a different query or after a ranking-algorithm
+    // change. Segment components are individually base64url-encoded so a plain Split on Sep is safe (no
+    // component can ever contain the raw separator).
+
+    public static string EncodePeopleSearch(int bucket, string sortKey, Guid id, string normalizedQuery, int rankingVersion) =>
+        ToBase64Url($"{bucket}{Sep}{ToBase64Url(sortKey)}{Sep}{id:N}{Sep}{ToBase64Url(normalizedQuery)}{Sep}{rankingVersion}");
+
+    public static bool TryDecodePeopleSearch(
+        string? cursor, out int bucket, out string sortKey, out Guid id, out string normalizedQuery, out int rankingVersion)
+    {
+        bucket = default;
+        sortKey = string.Empty;
+        id = default;
+        normalizedQuery = string.Empty;
+        rankingVersion = default;
+        if (!TryFromBase64Url(cursor, out var raw)) return false;
+        var parts = raw.Split(Sep);
+        if (parts.Length != 5) return false;
+        if (!int.TryParse(parts[0], out bucket)) return false;
+        if (!TryFromBase64Url(parts[1], out sortKey)) return false;
+        if (!Guid.TryParseExact(parts[2], "N", out id)) return false;
+        if (!TryFromBase64Url(parts[3], out normalizedQuery)) return false;
+        if (!int.TryParse(parts[4], out rankingVersion)) return false;
+        return true;
+    }
+
+    // ── Profile friend/mutual-friend list cursor: (normalizedSortKey, Guid) position, bound to
+    // (targetUserId, normalizedFilter, policyVersion, listContext) so a cursor cannot be replayed against a
+    // different target, search filter, listContext ("friends" vs "mutual"), or after the target's privacy
+    // policy version changes mid-pagination.
+
+    public static string EncodeProfileList(
+        string sortKey, Guid id, Guid targetUserId, string normalizedFilter, long policyVersion, string listContext) =>
+        ToBase64Url($"{ToBase64Url(sortKey)}{Sep}{id:N}{Sep}{targetUserId:N}{Sep}{ToBase64Url(normalizedFilter)}{Sep}{policyVersion}{Sep}{ToBase64Url(listContext)}");
+
+    public static bool TryDecodeProfileList(
+        string? cursor, out string sortKey, out Guid id, out Guid targetUserId, out string normalizedFilter,
+        out long policyVersion, out string listContext)
+    {
+        sortKey = string.Empty;
+        id = default;
+        targetUserId = default;
+        normalizedFilter = string.Empty;
+        policyVersion = default;
+        listContext = string.Empty;
+        if (!TryFromBase64Url(cursor, out var raw)) return false;
+        var parts = raw.Split(Sep);
+        if (parts.Length != 6) return false;
+        if (!TryFromBase64Url(parts[0], out sortKey)) return false;
+        if (!Guid.TryParseExact(parts[1], "N", out id)) return false;
+        if (!Guid.TryParseExact(parts[2], "N", out targetUserId)) return false;
+        if (!TryFromBase64Url(parts[3], out normalizedFilter)) return false;
+        if (!long.TryParse(parts[4], out policyVersion)) return false;
+        if (!TryFromBase64Url(parts[5], out listContext)) return false;
+        return true;
+    }
+
     // ── base64url (RFC 4648 §5) without external dependencies ──
 
     private static string ToBase64Url(string value)
@@ -60,7 +118,7 @@ public static class Cursor
     private static bool TryFromBase64Url(string? value, out string result)
     {
         result = string.Empty;
-        if (string.IsNullOrEmpty(value)) return false;
+        if (value is null) return false;
 
         var s = value.Replace('-', '+').Replace('_', '/');
         switch (s.Length % 4)

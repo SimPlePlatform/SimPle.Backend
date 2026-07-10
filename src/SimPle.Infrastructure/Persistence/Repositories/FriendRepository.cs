@@ -49,6 +49,8 @@ public sealed class FriendRepository : IFriendRepository
 
     public async Task<int> GetMutualFriendCountAsync(Guid userA, Guid userB, CancellationToken ct = default)
     {
+        var now = DateTime.UtcNow;
+
         var friendsOfA = _db.Friendships
             .Where(f => f.Status == FriendshipStatus.Accepted &&
                         (f.RequesterId == userA || f.AddresseeId == userA))
@@ -59,7 +61,43 @@ public sealed class FriendRepository : IFriendRepository
                         (f.RequesterId == userB || f.AddresseeId == userB))
             .Select(f => f.RequesterId == userB ? f.AddresseeId : f.RequesterId);
 
-        return await friendsOfA.Intersect(friendsOfB).CountAsync(ct);
+        var mutualIds = friendsOfA.Intersect(friendsOfB);
+
+        // M03-008 fix: this is a symmetric helper called from both viewer-orderings (and from contexts with
+        // no single fixed viewer), so a mutual candidate is excluded if EITHER party has a block with them —
+        // matches GetVisibleMutualFriendsPageAsync's privacy/suspension filter, conservatively applied to
+        // both sides rather than assuming which of userA/userB is "the viewer".
+        return await _db.Users
+            .Where(u => mutualIds.Contains(u.Id) &&
+                        u.Visibility != ProfileVisibility.Private &&
+                        !(u.IsSuspended && (u.SuspendedUntil == null || u.SuspendedUntil > now)) &&
+                        !_db.Blocks.Any(b =>
+                            (b.BlockerId == userA && b.BlockedId == u.Id) ||
+                            (b.BlockerId == u.Id && b.BlockedId == userA) ||
+                            (b.BlockerId == userB && b.BlockedId == u.Id) ||
+                            (b.BlockerId == u.Id && b.BlockedId == userB)))
+            .CountAsync(ct);
+    }
+
+    public async Task<int> GetVisibleFriendCountAsync(Guid targetUserId, Guid viewerId, CancellationToken ct = default)
+    {
+        var now = DateTime.UtcNow;
+
+        var candidateIds = _db.Friendships
+            .Where(f => f.Status == FriendshipStatus.Accepted &&
+                        (f.RequesterId == targetUserId || f.AddresseeId == targetUserId))
+            .Select(f => f.RequesterId == targetUserId ? f.AddresseeId : f.RequesterId);
+
+        // M03-008 fix: mirrors GetVisibleFriendsPageAsync's filter set exactly (visibility, suspension,
+        // blocks) so the count can never exceed what the paged list actually discloses.
+        return await _db.Users
+            .Where(u => candidateIds.Contains(u.Id) &&
+                        u.Visibility != ProfileVisibility.Private &&
+                        !(u.IsSuspended && (u.SuspendedUntil == null || u.SuspendedUntil > now)) &&
+                        !_db.Blocks.Any(b =>
+                            (b.BlockerId == viewerId && b.BlockedId == u.Id) ||
+                            (b.BlockerId == u.Id && b.BlockedId == viewerId)))
+            .CountAsync(ct);
     }
 
     // ── Reads: keyset cursor pages ──────────────────────────────────────────────
@@ -163,6 +201,163 @@ public sealed class FriendRepository : IFriendRepository
             .ToListAsync(ct);
 
         return rows.Select(x => (x.b, x.u)).ToList();
+    }
+
+    public async Task<IReadOnlyList<User>> GetVisibleFriendsPageAsync(
+        Guid targetUserId, Guid viewerId, string? normalizedQuery, int limit,
+        string? afterDisplayName, Guid? afterId, CancellationToken ct = default)
+    {
+        var now = DateTime.UtcNow;
+
+        var asRequester = _db.Friendships
+            .Where(f => f.Status == FriendshipStatus.Accepted && f.RequesterId == targetUserId)
+            .Select(f => f.AddresseeId);
+        var asAddressee = _db.Friendships
+            .Where(f => f.Status == FriendshipStatus.Accepted && f.AddresseeId == targetUserId)
+            .Select(f => f.RequesterId);
+        var candidateIds = asRequester.Union(asAddressee);
+
+        var query = _db.Users
+            .Where(u => candidateIds.Contains(u.Id) &&
+                        u.Visibility != ProfileVisibility.Private &&
+                        !(u.IsSuspended && (u.SuspendedUntil == null || u.SuspendedUntil > now)) &&
+                        !_db.Blocks.Any(b =>
+                            (b.BlockerId == viewerId && b.BlockedId == u.Id) ||
+                            (b.BlockerId == u.Id && b.BlockedId == viewerId)));
+
+        if (!string.IsNullOrWhiteSpace(normalizedQuery))
+        {
+            query = query.Where(u =>
+                u.NormalizedUsername.Contains(normalizedQuery) ||
+                u.DisplayName.ToUpper().Contains(normalizedQuery));
+        }
+
+        if (afterDisplayName is not null && afterId is Guid ai)
+        {
+            query = query.Where(u =>
+                u.DisplayName.ToUpper().CompareTo(afterDisplayName) > 0 ||
+                (u.DisplayName.ToUpper() == afterDisplayName && u.Id.CompareTo(ai) > 0));
+        }
+
+        return await query
+            .OrderBy(u => u.DisplayName.ToUpper())
+            .ThenBy(u => u.Id)
+            .Take(limit)
+            .ToListAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<User>> GetVisibleMutualFriendsPageAsync(
+        Guid viewerId, Guid targetUserId, int limit,
+        string? afterDisplayName, Guid? afterId, CancellationToken ct = default)
+    {
+        var now = DateTime.UtcNow;
+
+        var friendsOfViewer = _db.Friendships
+            .Where(f => f.Status == FriendshipStatus.Accepted && (f.RequesterId == viewerId || f.AddresseeId == viewerId))
+            .Select(f => f.RequesterId == viewerId ? f.AddresseeId : f.RequesterId);
+
+        var friendsOfTarget = _db.Friendships
+            .Where(f => f.Status == FriendshipStatus.Accepted && (f.RequesterId == targetUserId || f.AddresseeId == targetUserId))
+            .Select(f => f.RequesterId == targetUserId ? f.AddresseeId : f.RequesterId);
+
+        var mutualIds = friendsOfViewer.Intersect(friendsOfTarget);
+
+        var query = _db.Users
+            .Where(u => mutualIds.Contains(u.Id) &&
+                        u.Visibility != ProfileVisibility.Private &&
+                        !(u.IsSuspended && (u.SuspendedUntil == null || u.SuspendedUntil > now)) &&
+                        !_db.Blocks.Any(b =>
+                            (b.BlockerId == viewerId && b.BlockedId == u.Id) ||
+                            (b.BlockerId == u.Id && b.BlockedId == viewerId)));
+
+        if (afterDisplayName is not null && afterId is Guid ai)
+        {
+            query = query.Where(u =>
+                u.DisplayName.ToUpper().CompareTo(afterDisplayName) > 0 ||
+                (u.DisplayName.ToUpper() == afterDisplayName && u.Id.CompareTo(ai) > 0));
+        }
+
+        return await query
+            .OrderBy(u => u.DisplayName.ToUpper())
+            .ThenBy(u => u.Id)
+            .Take(limit)
+            .ToListAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<(User user, int bucket, int mutualCount, string relationshipState)>> SearchPeopleAsync(
+        Guid viewerId, string normalizedQuery, int limit,
+        int? afterBucket, string? afterSortKey, Guid? afterId, CancellationToken ct = default)
+    {
+        var now = DateTime.UtcNow;
+
+        var actorFriendIds = _db.Friendships
+            .Where(f => f.Status == FriendshipStatus.Accepted &&
+                        (f.RequesterId == viewerId || f.AddresseeId == viewerId))
+            .Select(f => f.RequesterId == viewerId ? f.AddresseeId : f.RequesterId);
+
+        var candidates = _db.Users
+            .Where(u => u.Id != viewerId &&
+                        !(u.IsSuspended && (u.SuspendedUntil == null || u.SuspendedUntil > now)) &&
+                        (u.NormalizedUsername == normalizedQuery ||
+                         u.NormalizedUsername.StartsWith(normalizedQuery) ||
+                         u.DisplayName.ToUpper().StartsWith(normalizedQuery)) &&
+                        !_db.Blocks.Any(b =>
+                            (b.BlockerId == viewerId && b.BlockedId == u.Id) ||
+                            (b.BlockerId == u.Id && b.BlockedId == viewerId)))
+            .GroupJoin(_db.UserFriendSettings, u => u.Id, s => s.UserId,
+                (u, settings) => new { User = u, Search = settings.Select(s => s.SearchVisibility).FirstOrDefault() })
+            .Select(x => new
+            {
+                x.User,
+                x.Search,
+                Bucket = x.User.NormalizedUsername == normalizedQuery ? 0
+                        : x.User.NormalizedUsername.StartsWith(normalizedQuery) ? 1
+                        : 2,
+                // M03-008 fix: a mutual candidate must itself be visible to the viewer (not private,
+                // not suspended, not blocked either way) or it must not count toward the disclosed total.
+                MutualCount = _db.Friendships.Count(mf =>
+                    mf.Status == FriendshipStatus.Accepted &&
+                    (mf.RequesterId == x.User.Id || mf.AddresseeId == x.User.Id) &&
+                    actorFriendIds.Contains(mf.RequesterId == x.User.Id ? mf.AddresseeId : mf.RequesterId) &&
+                    _db.Users.Any(mu =>
+                        mu.Id == (mf.RequesterId == x.User.Id ? mf.AddresseeId : mf.RequesterId) &&
+                        mu.Visibility != ProfileVisibility.Private &&
+                        !(mu.IsSuspended && (mu.SuspendedUntil == null || mu.SuspendedUntil > now))) &&
+                    !_db.Blocks.Any(b =>
+                        (b.BlockerId == viewerId && b.BlockedId == (mf.RequesterId == x.User.Id ? mf.AddresseeId : mf.RequesterId)) ||
+                        (b.BlockerId == (mf.RequesterId == x.User.Id ? mf.AddresseeId : mf.RequesterId) && b.BlockedId == viewerId))),
+            })
+            .Where(x => x.Search != SearchVisibility.Nobody &&
+                        (x.Search != SearchVisibility.FriendsOfFriends || x.MutualCount > 0));
+
+        if (afterBucket is int ab && afterSortKey is not null && afterId is Guid aid)
+        {
+            candidates = candidates.Where(x =>
+                x.Bucket > ab ||
+                (x.Bucket == ab && x.User.NormalizedUsername.CompareTo(afterSortKey) > 0) ||
+                (x.Bucket == ab && x.User.NormalizedUsername == afterSortKey && x.User.Id.CompareTo(aid) > 0));
+        }
+
+        var rows = await candidates
+            .OrderBy(x => x.Bucket).ThenBy(x => x.User.NormalizedUsername).ThenBy(x => x.User.Id)
+            .Take(limit)
+            .Select(x => new
+            {
+                x.User,
+                x.Bucket,
+                x.MutualCount,
+                RelationshipState = _db.Friendships
+                    .Where(f => (f.RequesterId == viewerId && f.AddresseeId == x.User.Id) ||
+                                (f.RequesterId == x.User.Id && f.AddresseeId == viewerId))
+                    .Select(f => f.Status == FriendshipStatus.Accepted ? "Friends"
+                                : f.Status == FriendshipStatus.Pending && f.RequesterId == viewerId ? "OutgoingPending"
+                                : f.Status == FriendshipStatus.Pending ? "IncomingPending"
+                                : "None")
+                    .FirstOrDefault() ?? "None"
+            })
+            .ToListAsync(ct);
+
+        return rows.Select(x => (x.User, x.Bucket, x.MutualCount, x.RelationshipState)).ToList();
     }
 
     public async Task<IReadOnlyList<(User user, int mutualCount)>> GetSuggestionsAsync(
@@ -367,25 +562,27 @@ public sealed class FriendRepository : IFriendRepository
     public Task<UserFriendSettings?> GetSettingsAsync(Guid userId, CancellationToken ct = default) =>
         _db.UserFriendSettings.FirstOrDefaultAsync(s => s.UserId == userId, ct);
 
-    public async Task UpsertSettingsAsync(Guid userId, FriendRequestPrivacy privacy, CancellationToken ct = default)
+    public async Task<UserFriendSettings> UpsertSettingsAsync(
+        Guid userId, FriendRequestPrivacy privacy, SearchVisibility? searchVisibility,
+        FriendsListVisibility? friendsListVisibility, CancellationToken ct = default)
     {
         for (var attempt = 0; attempt < 2; attempt++)
         {
             var existing = await _db.UserFriendSettings.FirstOrDefaultAsync(s => s.UserId == userId, ct);
             if (existing is not null)
             {
-                existing.UpdatePrivacy(privacy);
+                existing.UpdateSettings(privacy, searchVisibility, friendsListVisibility);
                 await _db.SaveChangesAsync(ct);
-                return;
+                return existing;
             }
 
             var newSettings = UserFriendSettings.CreateDefault(userId);
-            newSettings.UpdatePrivacy(privacy);
+            newSettings.UpdateSettings(privacy, searchVisibility, friendsListVisibility);
             try
             {
                 await _db.UserFriendSettings.AddAsync(newSettings, ct);
                 await _db.SaveChangesAsync(ct);
-                return;
+                return newSettings;
             }
             catch (DbUpdateException ex) when (IsUniqueViolation(ex))
             {

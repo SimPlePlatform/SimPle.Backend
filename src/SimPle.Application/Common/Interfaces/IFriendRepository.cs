@@ -22,12 +22,51 @@ public interface IFriendRepository
     Task<int> GetOutgoingRequestCountAsync(Guid userId, CancellationToken ct = default);
     Task<int> GetMutualFriendCountAsync(Guid userA, Guid userB, CancellationToken ct = default);
 
+    /// <summary>
+    /// Count of <paramref name="targetUserId"/>'s accepted friends, excluding any candidate blocked (either
+    /// direction) with <paramref name="viewerId"/> or currently suspended — a lightweight, reusable filtered
+    /// count. Full per-candidate profile-visibility filtering for the actual drill-down list lands in 2B.
+    /// </summary>
+    Task<int> GetVisibleFriendCountAsync(Guid targetUserId, Guid viewerId, CancellationToken ct = default);
+
     // ── Reads: keyset cursor pages (fetch up to `limit` rows; caller derives nextCursor) ─────────
 
     /// <summary>Friends ordered by (normalized display name, userId). Optional normalized search query.</summary>
     Task<IReadOnlyList<(Friendship f, User other)>> GetFriendsPageAsync(
         Guid userId, string? normalizedQuery, int limit,
         string? afterDisplayName, Guid? afterId, CancellationToken ct = default);
+
+    /// <summary>
+    /// <paramref name="targetUserId"/>'s accepted friends ordered by (normalized display name, userId),
+    /// with every candidate's current visibility/block/sanction policy applied against
+    /// <paramref name="viewerId"/> before ordering/paging: candidates blocked (either direction) with the
+    /// viewer, currently suspended, or <see cref="ProfileVisibility.Private"/> never appear, and never affect
+    /// the page length or cursor. Optional normalized search query narrows by username/display-name substring.
+    /// </summary>
+    Task<IReadOnlyList<User>> GetVisibleFriendsPageAsync(
+        Guid targetUserId, Guid viewerId, string? normalizedQuery, int limit,
+        string? afterDisplayName, Guid? afterId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Accepted friends common to both <paramref name="viewerId"/> and <paramref name="targetUserId"/>,
+    /// ordered by (normalized display name, userId), with the same viewer-block/suspension/Private filtering
+    /// as <see cref="GetVisibleFriendsPageAsync"/> applied before ordering/paging.
+    /// </summary>
+    Task<IReadOnlyList<User>> GetVisibleMutualFriendsPageAsync(
+        Guid viewerId, Guid targetUserId, int limit,
+        string? afterDisplayName, Guid? afterId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Bounded people-search candidates ranked by (bucket, normalized username, userId) where bucket 0 =
+    /// exact username match, 1 = username prefix, 2 = display-name prefix. Excludes <paramref name="viewerId"/>
+    /// itself, suspended accounts, candidates blocked (either direction) with the viewer, and search-ineligible
+    /// candidates (<see cref="SearchVisibility.Nobody"/>, or <see cref="SearchVisibility.FriendsOfFriends"/>
+    /// with zero viewer-visible mutual friends). <paramref name="normalizedQuery"/> must already be
+    /// upper-invariant. Never promises a global/hidden total.
+    /// </summary>
+    Task<IReadOnlyList<(User user, int bucket, int mutualCount, string relationshipState)>> SearchPeopleAsync(
+        Guid viewerId, string normalizedQuery, int limit,
+        int? afterBucket, string? afterSortKey, Guid? afterId, CancellationToken ct = default);
 
     /// <summary>Pending requests ordered by (SentAt DESC, Id DESC). Mutual counts projected server-side.</summary>
     Task<IReadOnlyList<(Friendship f, User requester, User addressee, int mutualCount)>> GetRequestsPageAsync(
@@ -84,5 +123,9 @@ public interface IFriendRepository
     // ── Settings (read never creates a row) ─────────────────────────────────────
 
     Task<UserFriendSettings?> GetSettingsAsync(Guid userId, CancellationToken ct = default);
-    Task UpsertSettingsAsync(Guid userId, FriendRequestPrivacy privacy, CancellationToken ct = default);
+
+    /// <summary>Independently upserts any subset of settings (null = leave unchanged) and returns the result.</summary>
+    Task<UserFriendSettings> UpsertSettingsAsync(
+        Guid userId, FriendRequestPrivacy privacy, SearchVisibility? searchVisibility,
+        FriendsListVisibility? friendsListVisibility, CancellationToken ct = default);
 }

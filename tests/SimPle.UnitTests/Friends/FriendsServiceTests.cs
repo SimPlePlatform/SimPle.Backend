@@ -35,6 +35,10 @@ public sealed class FriendsServiceTests
         var storageOptions = Options.Create(new StorageOptions { ReadUrlExpiryMinutes = 15 });
         _storage.CreatePresignedReadUrlAsync(Arg.Any<string>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(ci => $"https://cdn.test/{ci.ArgAt<string>(0)}");
+        _friends.UpsertSettingsAsync(
+                Arg.Any<Guid>(), Arg.Any<FriendRequestPrivacy>(), Arg.Any<SearchVisibility?>(),
+                Arg.Any<FriendsListVisibility?>(), Arg.Any<CancellationToken>())
+            .Returns(ci => SettingsWith(ci.Arg<Guid>(), ci.Arg<FriendRequestPrivacy>()));
         _service = new FriendsService(_friends, _users, _storage, storageOptions, NullLogger<FriendsService>.Instance);
     }
 
@@ -66,7 +70,7 @@ public sealed class FriendsServiceTests
     private UserFriendSettings SettingsWith(Guid userId, FriendRequestPrivacy privacy)
     {
         var s = UserFriendSettings.CreateDefault(userId);
-        s.UpdatePrivacy(privacy);
+        s.UpdateSettings(privacy, null, null);
         return s;
     }
 
@@ -314,6 +318,65 @@ public sealed class FriendsServiceTests
 
         r.IsSuccess.Should().BeFalse();
         r.Error!.Code.Should().Be("Friends.ConcurrencyConflict");
+    }
+
+    // ── Send: abuse cap (3/day/account-target) ───────────────────────────────────
+
+    [Fact]
+    public async Task Send_CapExceededWithinWindow_SendCapExceeded429WithRetryAfter()
+    {
+        var (actor, target) = SetupSendableTarget();
+        var edge = Pending(actor.Id, target.Id);
+        var windowStart = DateTime.UtcNow;
+        edge.Decline(target.Id, windowStart.AddDays(-1));   // cooldown already expired, doesn't block resend
+        // Three sends already recorded by actor in the still-open 24h window (fresh-row send + two reactivate sends).
+        edge.RecordSend(actor.Id, windowStart, TimeSpan.FromDays(1));
+        edge.RecordSend(actor.Id, windowStart, TimeSpan.FromDays(1));
+        edge.RecordSend(actor.Id, windowStart, TimeSpan.FromDays(1));
+        _friends.GetEdgeAsync(actor.Id, target.Id).Returns(edge);
+
+        var r = await _service.SendFriendRequestAsync(actor.Id, target.Id);
+
+        r.IsSuccess.Should().BeFalse();
+        r.Error!.Code.Should().Be("Friends.SendCapExceeded");
+        r.Error.RetryAfterUtc.Should().BeCloseTo(windowStart.AddDays(1), TimeSpan.FromSeconds(2));
+        await _friends.DidNotReceive().TryUpdateFriendshipAsync(Arg.Any<Friendship>(), Arg.Any<OutboxMessage>());
+    }
+
+    [Fact]
+    public async Task Send_CapWindowElapsed_AllowsResendDespiteThreePriorSends()
+    {
+        var (actor, target) = SetupSendableTarget();
+        var edge = Pending(actor.Id, target.Id);
+        var oldWindowStart = DateTime.UtcNow.AddDays(-2);
+        edge.Decline(target.Id, oldWindowStart.AddHours(1));   // cooldown expired relative to now
+        edge.RecordSend(actor.Id, oldWindowStart, TimeSpan.FromDays(1));
+        edge.RecordSend(actor.Id, oldWindowStart, TimeSpan.FromDays(1));
+        edge.RecordSend(actor.Id, oldWindowStart, TimeSpan.FromDays(1));
+        _friends.GetEdgeAsync(actor.Id, target.Id).Returns(edge);
+        _friends.TryUpdateFriendshipAsync(Arg.Any<Friendship>(), Arg.Any<OutboxMessage>())
+            .Returns(UpdateFriendshipOutcome.Updated);
+
+        var r = await _service.SendFriendRequestAsync(actor.Id, target.Id);
+
+        r.IsSuccess.Should().BeTrue();
+        r.Value!.Outcome.Should().Be(SendFriendRequestResult.RequestCreated);
+    }
+
+    [Fact]
+    public async Task Send_NewTargetUnaffectedByAnotherPairsCap()
+    {
+        // A cap recorded against one target must never throttle a first-ever send to a different target —
+        // the cap lives on the per-pair Friendship row, and a brand-new pair has no row yet.
+        var (actor, target) = SetupSendableTarget();
+        _friends.GetEdgeAsync(actor.Id, target.Id).Returns((Friendship?)null);
+        _friends.TryAddFriendshipAsync(Arg.Any<Friendship>(), Arg.Any<OutboxMessage>())
+            .Returns(AddFriendshipOutcome.Added);
+
+        var r = await _service.SendFriendRequestAsync(actor.Id, target.Id);
+
+        r.IsSuccess.Should().BeTrue();
+        r.Value!.Outcome.Should().Be(SendFriendRequestResult.RequestCreated);
     }
 
     /// <summary>Sets up a mutually-sendable actor/target (Anyone privacy, not blocked, both resolvable).</summary>
@@ -894,6 +957,31 @@ public sealed class FriendsServiceTests
     // ── Settings ────────────────────────────────────────────────────────────────
 
     [Fact]
+    public void UserFriendSettings_UpdateSettings_NoActualChange_DoesNotBumpVersion()
+    {
+        var s = UserFriendSettings.CreateDefault(Guid.NewGuid());
+        var versionBefore = s.PrivacyPolicyVersion;
+
+        s.UpdateSettings(s.FriendRequestPrivacy, null, null);
+
+        s.PrivacyPolicyVersion.Should().Be(versionBefore);
+    }
+
+    [Fact]
+    public void UserFriendSettings_UpdateSettings_ActualChange_BumpsVersionOnce()
+    {
+        var s = UserFriendSettings.CreateDefault(Guid.NewGuid());
+        var versionBefore = s.PrivacyPolicyVersion;
+
+        s.UpdateSettings(FriendRequestPrivacy.Off, SearchVisibility.Nobody, FriendsListVisibility.OnlyMe);
+
+        s.PrivacyPolicyVersion.Should().Be(versionBefore + 1);
+        s.FriendRequestPrivacy.Should().Be(FriendRequestPrivacy.Off);
+        s.SearchVisibility.Should().Be(SearchVisibility.Nobody);
+        s.FriendsListVisibility.Should().Be(FriendsListVisibility.OnlyMe);
+    }
+
+    [Fact]
     public async Task GetSettings_NoRow_DefaultsAnyone_NoWrite()
     {
         var actor = Guid.NewGuid();
@@ -903,13 +991,14 @@ public sealed class FriendsServiceTests
 
         r.Value!.FriendRequestPrivacy.Should().Be("Anyone");
         await _friends.DidNotReceive().UpsertSettingsAsync(
-            Arg.Any<Guid>(), Arg.Any<FriendRequestPrivacy>(), Arg.Any<CancellationToken>());
+            Arg.Any<Guid>(), Arg.Any<FriendRequestPrivacy>(), Arg.Any<SearchVisibility?>(),
+            Arg.Any<FriendsListVisibility?>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
     public async Task UpdateSettings_Invalid_ValidationFailed400()
     {
-        var r = await _service.UpdateSettingsAsync(Guid.NewGuid(), "Nope");
+        var r = await _service.UpdateSettingsAsync(Guid.NewGuid(), "Nope", null, null);
         r.Error!.Code.Should().Be("Validation.Failed");
     }
 
@@ -920,10 +1009,51 @@ public sealed class FriendsServiceTests
     public async Task UpdateSettings_Valid_Upserts(string input, FriendRequestPrivacy expected)
     {
         var actor = Guid.NewGuid();
-        var r = await _service.UpdateSettingsAsync(actor, input);
+        var r = await _service.UpdateSettingsAsync(actor, input, null, null);
 
         r.IsSuccess.Should().BeTrue();
-        await _friends.Received(1).UpsertSettingsAsync(actor, expected, Arg.Any<CancellationToken>());
+        await _friends.Received(1).UpsertSettingsAsync(
+            actor, expected, Arg.Any<SearchVisibility?>(), Arg.Any<FriendsListVisibility?>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task GetSettings_NoRow_DefaultsSearchEveryoneAndFriendsListFriends()
+    {
+        var actor = Guid.NewGuid();
+        _friends.GetSettingsAsync(actor).Returns((UserFriendSettings?)null);
+
+        var r = await _service.GetSettingsAsync(actor);
+
+        r.Value!.SearchVisibility.Should().Be("Everyone");
+        r.Value.FriendsListVisibility.Should().Be("Friends");
+    }
+
+    [Fact]
+    public async Task UpdateSettings_InvalidSearchVisibility_ValidationFailed()
+    {
+        var r = await _service.UpdateSettingsAsync(Guid.NewGuid(), "Anyone", "NotAValue", null);
+        r.IsSuccess.Should().BeFalse();
+        r.Error!.Code.Should().Be("Validation.Failed");
+    }
+
+    [Fact]
+    public async Task UpdateSettings_InvalidFriendsListVisibility_ValidationFailed()
+    {
+        var r = await _service.UpdateSettingsAsync(Guid.NewGuid(), "Anyone", null, "NotAValue");
+        r.IsSuccess.Should().BeFalse();
+        r.Error!.Code.Should().Be("Validation.Failed");
+    }
+
+    [Fact]
+    public async Task UpdateSettings_PartialUpdate_LeavesUnspecifiedFieldsNull()
+    {
+        var actor = Guid.NewGuid();
+        var r = await _service.UpdateSettingsAsync(actor, "Anyone", "Nobody", null);
+
+        r.IsSuccess.Should().BeTrue();
+        await _friends.Received(1).UpsertSettingsAsync(
+            actor, FriendRequestPrivacy.Anyone, SearchVisibility.Nobody,
+            Arg.Is<FriendsListVisibility?>(v => v == null), Arg.Any<CancellationToken>());
     }
 
     // ── Friend-list search validation ───────────────────────────────────────────
