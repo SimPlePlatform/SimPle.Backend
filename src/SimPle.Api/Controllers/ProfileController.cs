@@ -6,6 +6,7 @@ using SimPle.Api.Models;
 using SimPle.Application.Profiles.DTOs;
 using SimPle.Application.Profiles.Services;
 using SimPle.Application.Profiles.Validators;
+using SimPle.Shared.Common;
 using Swashbuckle.AspNetCore.Annotations;
 
 namespace SimPle.Api.Controllers;
@@ -93,6 +94,7 @@ public sealed class ProfileController : ControllerBase
     // ── Public profile ────────────────────────────────────────────────────────
 
     [HttpGet("{username}")]
+    [EnableRateLimiting("profile-public")]
     [SwaggerOperation(Summary = "Get a public profile by username",
         OperationId = "Profile_GetPublic", Tags = new[] { "Profile" })]
     [ProducesResponseType(typeof(ProfileDto), StatusCodes.Status200OK)]
@@ -103,15 +105,76 @@ public sealed class ProfileController : ControllerBase
         if (TryGetUserId(out var id)) requesterId = id;
 
         var result = await _profile.GetPublicProfileAsync(username, requesterId, ct);
-        if (!result.IsSuccess)
-        {
-            return result.Error!.Code switch
-            {
-                "General.NotFound" => NotFound(Error(result.Error.Code, result.Error.Message)),
-                _ => StatusCode(StatusCodes.Status403Forbidden, Error(result.Error.Code, result.Error.Message))
-            };
-        }
+        if (!result.IsSuccess) return MapError(result.Error!);
+        // M03-011 fix: explicit header now (rather than relying on default/no-header behavior) so that if a
+        // CDN/reverse-proxy shared cache is later placed in front of this route, it cannot store the
+        // authenticated response under an anonymous key or vice versa. Anonymous responses are cacheable only
+        // for a short TTL and keyed by cookie presence; no shared-cache middleware is registered today so this
+        // has no runtime effect yet.
+        Response.Headers.CacheControl = requesterId.HasValue ? "private, no-store" : "public, max-age=30";
+        Response.Headers.Vary = "Cookie";
         return Ok(result.Value);
+    }
+
+    [HttpGet("{username}/viewer-context")]
+    [Authorize]
+    [EnableRateLimiting("profile-viewer-context")]
+    [SwaggerOperation(Summary = "Get the authenticated viewer's relationship/action context for a profile",
+        OperationId = "Profile_GetViewerContext", Tags = new[] { "Profile" })]
+    [ProducesResponseType(typeof(ProfileViewerContextDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    public async Task<IActionResult> GetViewerContext([FromRoute] string username, CancellationToken ct)
+    {
+        if (!TryGetUserId(out var viewerId)) return Unauthorized();
+
+        Response.Headers.CacheControl = "private, no-store";
+        var result = await _profile.GetViewerContextAsync(username, viewerId, ct);
+        return result.IsSuccess ? Ok(result.Value) : MapError(result.Error!);
+    }
+
+    [HttpGet("{username}/friends")]
+    [EnableRateLimiting("profile-friends")]
+    [SwaggerOperation(Summary = "Get a profile's accepted friends list (keyset cursor paged, privacy-filtered)",
+        OperationId = "Profile_GetFriends", Tags = new[] { "Profile" })]
+    [ProducesResponseType(typeof(CursorPage<PublicIdentityDto>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> GetFriends(
+        [FromRoute] string username,
+        [FromQuery] string? query,
+        [FromQuery] int limit = 20,
+        [FromQuery] string? cursor = null,
+        CancellationToken ct = default)
+    {
+        Guid? viewerId = null;
+        if (TryGetUserId(out var id)) viewerId = id;
+
+        Response.Headers.CacheControl = "private, no-store";
+        var result = await _profile.GetFriendsListAsync(username, viewerId, query, limit, cursor, ct);
+        return result.IsSuccess ? Ok(result.Value) : MapError(result.Error!);
+    }
+
+    [HttpGet("{username}/mutual-friends")]
+    [Authorize]
+    [EnableRateLimiting("profile-mutual-friends")]
+    [SwaggerOperation(Summary = "Get friends common to the authenticated viewer and a profile (keyset cursor paged)",
+        OperationId = "Profile_GetMutualFriends", Tags = new[] { "Profile" })]
+    [ProducesResponseType(typeof(CursorPage<PublicIdentityDto>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(typeof(ApiErrorResponse), StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> GetMutualFriends(
+        [FromRoute] string username,
+        [FromQuery] int limit = 20,
+        [FromQuery] string? cursor = null,
+        CancellationToken ct = default)
+    {
+        if (!TryGetUserId(out var viewerId)) return Unauthorized();
+
+        Response.Headers.CacheControl = "private, no-store";
+        var result = await _profile.GetMutualFriendsListAsync(username, viewerId, limit, cursor, ct);
+        return result.IsSuccess ? Ok(result.Value) : MapError(result.Error!);
     }
 
     // ── Avatar / banner upload ────────────────────────────────────────────────
@@ -435,6 +498,17 @@ public sealed class ProfileController : ControllerBase
 
     private bool TryGetUserId(out Guid userId) =>
         Guid.TryParse(User.FindFirst(JwtRegisteredClaimNames.Sub)?.Value, out userId);
+
+    /// <summary>
+    /// Maps a domain <see cref="Error"/> to the canonical HTTP status. Profile visibility denials
+    /// (nonexistent, private, blocked, suspended targets) always surface as 404, never 403.
+    /// </summary>
+    private IActionResult MapError(Error error) =>
+        error.Code switch
+        {
+            "Profile.NotVisible" => NotFound(Error(error.Code, error.Message)),
+            _ => BadRequest(Error(error.Code, error.Message)),
+        };
 
     private static ApiErrorResponse Error(string code, string message) =>
         new(new ApiErrorDetail(code, message));

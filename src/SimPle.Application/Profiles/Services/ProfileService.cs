@@ -1,7 +1,10 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
+using SimPle.Application.Common.Pagination;
 using SimPle.Application.Profiles.DTOs;
+using SimPle.Domain.Friends;
 using SimPle.Domain.Profiles;
 using SimPle.Domain.Users;
 using SimPle.Shared.Common;
@@ -13,24 +16,39 @@ public sealed class ProfileService : IProfileService
     private readonly IUserRepository _users;
     private readonly IProfileRepository _profiles;
     private readonly IUsernameChangeRequestRepository _usernameRequests;
+    private readonly IRetiredUsernameRepository _retiredUsernames;
     private readonly IFileStorageService _storage;
     private readonly StorageOptions _storageOptions;
+    private readonly IFriendRepository _friends;
+    private readonly ILogger<ProfileService> _logger;
 
     private static readonly HashSet<string> AllowedImageTypes =
         new(StringComparer.OrdinalIgnoreCase) { "image/jpeg", "image/png", "image/webp" };
+
+    private const int DefaultListLimit = 20;
+    private const int MaxListLimit = 50;
+    private const string NotVisibleCode = "Profile.NotVisible";
+    private const string InvalidCursor = "Pagination.InvalidCursor";
+    private const string ValidationFailed = "Validation.Failed";
 
     public ProfileService(
         IUserRepository users,
         IProfileRepository profiles,
         IUsernameChangeRequestRepository usernameRequests,
+        IRetiredUsernameRepository retiredUsernames,
         IFileStorageService storage,
-        IOptions<StorageOptions> storageOptions)
+        IOptions<StorageOptions> storageOptions,
+        IFriendRepository friends,
+        ILogger<ProfileService> logger)
     {
         _users = users;
         _profiles = profiles;
         _usernameRequests = usernameRequests;
+        _retiredUsernames = retiredUsernames;
         _storage = storage;
         _storageOptions = storageOptions.Value;
+        _friends = friends;
+        _logger = logger;
     }
 
     public async Task<Result<ProfileDto>> GetMyProfileAsync(Guid userId, CancellationToken ct = default)
@@ -46,15 +64,268 @@ public sealed class ProfileService : IProfileService
     {
         var normalized = username.Trim().ToUpperInvariant();
         var user = await _users.GetByNormalizedUsernameAsync(normalized, ct);
-        if (user is null) return Result<ProfileDto>.Fail("General.NotFound", "Profile not found.");
 
-        if (user.Visibility == ProfileVisibility.Private && user.Id != requesterId)
-            return Result<ProfileDto>.Fail("Profile.Private", "This profile is private.");
+        // Do the same membership/visibility work whether or not the account exists so a guessed, retired, or
+        // private/blocked/suspended username is body- and latency-indistinguishable (mirrors
+        // FriendsService.DiscoverByUsernameAsync's timing-safe pattern).
+        var probeId = user?.Id ?? Guid.Empty;
+        var isSelf = requesterId.HasValue && user is not null && user.Id == requesterId.Value;
+        var suspended = user is not null && user.IsAccountSuspended();
+        var blocked = !isSelf && requesterId.HasValue
+            && await _friends.IsBlockedInEitherDirectionAsync(probeId, requesterId.Value, ct);
+        var isFriend = requesterId.HasValue
+            && await _friends.AreFriendsAsync(probeId, requesterId.Value, ct);
 
-        if (user.Visibility == ProfileVisibility.FriendsOnly && user.Id != requesterId)
-            return Result<ProfileDto>.Fail("Profile.FriendsOnly", "This profile is visible to friends only.");
+        var visible = user is not null && !suspended && !blocked && (isSelf || user.Visibility switch
+        {
+            ProfileVisibility.Public => true,
+            ProfileVisibility.FriendsOnly => isFriend,
+            ProfileVisibility.Private => false,
+            _ => false,
+        });
 
-        return await BuildDtoAsync(user, ct);
+        if (!visible)
+        {
+            _logger.LogInformation(
+                "Security: Profile access denied. ActorId={ActorId} TargetUsername={TargetUsername} Action={Action} Result={Result}",
+                requesterId.HasValue ? requesterId.Value.ToString() : "Anonymous", username, "GetPublicProfile", "NotVisible");
+            return Result<ProfileDto>.Fail("Profile.NotVisible", "This profile is not available.");
+        }
+
+        return await BuildDtoAsync(user!, ct);
+    }
+
+    public async Task<Result<ProfileViewerContextDto>> GetViewerContextAsync(
+        string username, Guid viewerId, CancellationToken ct = default)
+    {
+        var normalized = username.Trim().ToUpperInvariant();
+        var target = await _users.GetByNormalizedUsernameAsync(normalized, ct);
+
+        // Same timing-safe uniform-work shape as GetPublicProfileAsync.
+        var probeId = target?.Id ?? Guid.Empty;
+        var isSelf = target is not null && target.Id == viewerId;
+        var suspended = target is not null && target.IsAccountSuspended();
+        var targetBlockedViewer = !isSelf && await _friends.GetBlockAsync(probeId, viewerId, ct) is not null;
+        var viewerBlockedTarget = !isSelf && await _friends.GetBlockAsync(viewerId, probeId, ct) is not null;
+        var isFriend = !isSelf && await _friends.AreFriendsAsync(probeId, viewerId, ct);
+        var edge = !isSelf ? await _friends.GetEdgeAsync(probeId, viewerId, ct) : null;
+
+        // Unlike the base profile route (which 404s on a block in either direction), viewer-context 404s
+        // only for BlockedByTarget: a viewer who has blocked the target must still see BlockedBySelf so they
+        // can act on it (Unblock), bypassing the target's own ProfileVisibility gate for that one case.
+        var visible = target is not null && !suspended && !targetBlockedViewer && (isSelf || viewerBlockedTarget || target.Visibility switch
+        {
+            ProfileVisibility.Public => true,
+            ProfileVisibility.FriendsOnly => isFriend,
+            ProfileVisibility.Private => false,
+            _ => false,
+        });
+
+        if (!visible)
+        {
+            _logger.LogInformation(
+                "Security: Profile access denied. ActorId={ActorId} TargetUsername={TargetUsername} Action={Action} Result={Result}",
+                viewerId, username, "GetViewerContext", "NotVisible");
+            return Result<ProfileViewerContextDto>.Fail("Profile.NotVisible", "This profile is not available.");
+        }
+
+        string relationshipState;
+        IReadOnlyList<string> allowedActions;
+        if (isSelf)
+        {
+            relationshipState = "Self";
+            allowedActions = new[] { "edit", "share" };
+        }
+        else if (viewerBlockedTarget)
+        {
+            relationshipState = "BlockedBySelf";
+            allowedActions = new[] { "unblock", "share" };
+        }
+        else if (isFriend)
+        {
+            relationshipState = "Friends";
+            allowedActions = new[] { "invite_unavailable", "remove", "share", "block", "report_disabled" };
+        }
+        else if (edge is { Status: FriendshipStatus.Pending })
+        {
+            if (edge.RequesterId == viewerId)
+            {
+                relationshipState = "OutgoingPending";
+                allowedActions = new[] { "pending", "cancel", "share", "more" };
+            }
+            else
+            {
+                relationshipState = "IncomingPending";
+                allowedActions = new[] { "accept", "decline", "share", "more" };
+            }
+        }
+        else
+        {
+            relationshipState = "None";
+            allowedActions = new[] { "add_friend", "share", "block", "report_disabled" };
+        }
+
+        var settings = await _friends.GetSettingsAsync(probeId, ct);
+        var friendsListVisibility = settings?.FriendsListVisibility ?? FriendsListVisibility.Friends;
+        var canViewFriends = isSelf || friendsListVisibility switch
+        {
+            FriendsListVisibility.Everyone => true,
+            FriendsListVisibility.Friends => isFriend,
+            FriendsListVisibility.OnlyMe => false,
+            _ => false,
+        };
+
+        int? visibleFriendCount = canViewFriends
+            ? isSelf
+                ? await _friends.GetFriendCountAsync(probeId, ct)
+                : await _friends.GetVisibleFriendCountAsync(probeId, viewerId, ct)
+            : null;
+
+        var visibleMutualFriendCount = isSelf ? 0 : await _friends.GetMutualFriendCountAsync(probeId, viewerId, ct);
+
+        return Result<ProfileViewerContextDto>.Ok(new ProfileViewerContextDto(
+            relationshipState, visibleMutualFriendCount, canViewFriends, visibleFriendCount, allowedActions));
+    }
+
+    public async Task<Result<CursorPage<PublicIdentityDto>>> GetFriendsListAsync(
+        string username, Guid? viewerId, string? query, int limit, string? cursor, CancellationToken ct = default)
+    {
+        limit = ClampListLimit(limit);
+        var normalizedQuery = NormalizeListQuery(query, out var queryError);
+        if (queryError is not null)
+            return Result<CursorPage<PublicIdentityDto>>.Fail(ValidationFailed, queryError);
+
+        var normalizedUsername = username.Trim().ToUpperInvariant();
+        var target = await _users.GetByNormalizedUsernameAsync(normalizedUsername, ct);
+
+        // Same timing-safe uniform-work shape as GetPublicProfileAsync/GetViewerContextAsync.
+        var probeId = target?.Id ?? Guid.Empty;
+        var isSelf = viewerId.HasValue && target is not null && target.Id == viewerId.Value;
+        var suspended = target is not null && target.IsAccountSuspended();
+        var blocked = viewerId.HasValue && !isSelf
+            && await _friends.IsBlockedInEitherDirectionAsync(probeId, viewerId.Value, ct);
+        var isFriend = viewerId.HasValue && !isSelf && await _friends.AreFriendsAsync(probeId, viewerId.Value, ct);
+
+        var settings = await _friends.GetSettingsAsync(probeId, ct);
+        var friendsListVisibility = settings?.FriendsListVisibility ?? FriendsListVisibility.Friends;
+        var policyVersion = settings?.PrivacyPolicyVersion ?? 1;
+
+        // Anonymous callers additionally need the base profile to be Public (footnote in spec-r2's contract
+        // table); authenticated callers are gated purely by FriendsListVisibility, mirroring canViewFriends
+        // in GetViewerContextAsync (the four privacy settings are independent — ProfileVisibility does not
+        // gate an authenticated viewer's access to the friends list).
+        var canView = target is not null && !suspended && !blocked && (isSelf || (viewerId.HasValue
+            ? friendsListVisibility switch
+              {
+                  FriendsListVisibility.Everyone => true,
+                  FriendsListVisibility.Friends => isFriend,
+                  FriendsListVisibility.OnlyMe => false,
+                  _ => false,
+              }
+            : target!.Visibility == ProfileVisibility.Public && friendsListVisibility == FriendsListVisibility.Everyone));
+
+        if (!canView)
+        {
+            _logger.LogInformation(
+                "Security: Friends list access denied. ActorId={ActorId} TargetUsername={TargetUsername} Action={Action} Result={Result}",
+                viewerId.HasValue ? viewerId.Value.ToString() : "Anonymous", username, "GetFriendsList", "NotVisible");
+            return Result<CursorPage<PublicIdentityDto>>.Fail(NotVisibleCode, "This profile is not available.");
+        }
+
+        string? afterDisplayName = null;
+        Guid? afterId = null;
+        if (cursor is not null)
+        {
+            if (!Cursor.TryDecodeProfileList(
+                    cursor, out var sortKey, out var id, out var cursorTarget, out var cursorFilter,
+                    out var cursorPolicyVersion, out var listContext)
+                || cursorTarget != target!.Id || cursorFilter != (normalizedQuery ?? string.Empty)
+                || cursorPolicyVersion != policyVersion || listContext != "friends")
+            {
+                return Result<CursorPage<PublicIdentityDto>>.Fail(InvalidCursor, "The pagination cursor is invalid.");
+            }
+            afterDisplayName = sortKey;
+            afterId = id;
+        }
+
+        var rows = await _friends.GetVisibleFriendsPageAsync(
+            target!.Id, viewerId ?? Guid.Empty, normalizedQuery, limit, afterDisplayName, afterId, ct);
+
+        var items = new List<PublicIdentityDto>(rows.Count);
+        foreach (var u in rows)
+            items.Add(await ToIdentityDtoAsync(u, ct));
+
+        string? next = rows.Count == limit
+            ? Cursor.EncodeProfileList(
+                rows[^1].DisplayName.ToUpperInvariant(), rows[^1].Id, target.Id, normalizedQuery ?? string.Empty,
+                policyVersion, "friends")
+            : null;
+
+        return Result<CursorPage<PublicIdentityDto>>.Ok(new CursorPage<PublicIdentityDto>(items, next));
+    }
+
+    public async Task<Result<CursorPage<PublicIdentityDto>>> GetMutualFriendsListAsync(
+        string username, Guid viewerId, int limit, string? cursor, CancellationToken ct = default)
+    {
+        limit = ClampListLimit(limit);
+
+        var normalizedUsername = username.Trim().ToUpperInvariant();
+        var target = await _users.GetByNormalizedUsernameAsync(normalizedUsername, ct);
+
+        var probeId = target?.Id ?? Guid.Empty;
+        var isSelf = target is not null && target.Id == viewerId;
+        var suspended = target is not null && target.IsAccountSuspended();
+        var blocked = !isSelf && await _friends.IsBlockedInEitherDirectionAsync(probeId, viewerId, ct);
+        var isFriend = !isSelf && await _friends.AreFriendsAsync(probeId, viewerId, ct);
+
+        var settings = await _friends.GetSettingsAsync(probeId, ct);
+        var friendsListVisibility = settings?.FriendsListVisibility ?? FriendsListVisibility.Friends;
+        var policyVersion = settings?.PrivacyPolicyVersion ?? 1;
+
+        var canView = target is not null && !suspended && !blocked && (isSelf || friendsListVisibility switch
+        {
+            FriendsListVisibility.Everyone => true,
+            FriendsListVisibility.Friends => isFriend,
+            FriendsListVisibility.OnlyMe => false,
+            _ => false,
+        });
+
+        if (!canView)
+        {
+            _logger.LogInformation(
+                "Security: Mutual friends list access denied. ActorId={ActorId} TargetUsername={TargetUsername} Action={Action} Result={Result}",
+                viewerId, username, "GetMutualFriendsList", "NotVisible");
+            return Result<CursorPage<PublicIdentityDto>>.Fail(NotVisibleCode, "This profile is not available.");
+        }
+
+        string? afterDisplayName = null;
+        Guid? afterId = null;
+        if (cursor is not null)
+        {
+            if (!Cursor.TryDecodeProfileList(
+                    cursor, out var sortKey, out var id, out var cursorTarget, out var cursorFilter,
+                    out var cursorPolicyVersion, out var listContext)
+                || cursorTarget != target!.Id || cursorFilter != string.Empty
+                || cursorPolicyVersion != policyVersion || listContext != "mutual")
+            {
+                return Result<CursorPage<PublicIdentityDto>>.Fail(InvalidCursor, "The pagination cursor is invalid.");
+            }
+            afterDisplayName = sortKey;
+            afterId = id;
+        }
+
+        var rows = await _friends.GetVisibleMutualFriendsPageAsync(viewerId, target!.Id, limit, afterDisplayName, afterId, ct);
+
+        var items = new List<PublicIdentityDto>(rows.Count);
+        foreach (var u in rows)
+            items.Add(await ToIdentityDtoAsync(u, ct));
+
+        string? next = rows.Count == limit
+            ? Cursor.EncodeProfileList(
+                rows[^1].DisplayName.ToUpperInvariant(), rows[^1].Id, target.Id, string.Empty, policyVersion, "mutual")
+            : null;
+
+        return Result<CursorPage<PublicIdentityDto>>.Ok(new CursorPage<PublicIdentityDto>(items, next));
     }
 
     public async Task<Result<ProfileDto>> UpdateProfileAsync(
@@ -164,15 +435,19 @@ public sealed class ProfileService : IProfileService
         if (user.NormalizedUsername == normalized)
             return Result<UsernameChangeResultDto>.Fail("Profile.SameUsername", "The requested username is the same as your current one.");
 
-        if (await _users.ExistsByUsernameAsync(normalized, ct))
+        if (await _users.ExistsByUsernameAsync(normalized, ct) || await _retiredUsernames.IsRetiredAsync(normalized, ct))
             return Result<UsernameChangeResultDto>.Fail("Profile.UsernameTaken", "That username is already in use.");
 
         var now = DateTime.UtcNow;
         if (!user.HasUsedImmediateUsernameChangeIn(now.Year, now.Month))
         {
+            var previousNormalizedUsername = user.NormalizedUsername;
             user.UpdateUsername(newUsername);
             user.RecordImmediateUsernameChange(now.Year, now.Month);
             await _users.UpdateAsync(user, ct);
+            // Rename first, then retire: if this second write fails, the old name is simply not yet
+            // retired (a minor gap) rather than falsely retired while the rename never completed.
+            await _retiredUsernames.AddAsync(RetiredUsername.Create(previousNormalizedUsername, user.Id), ct);
 
             return Result<UsernameChangeResultDto>.Ok(new(
                 AppliedImmediately: true,
@@ -246,7 +521,7 @@ public sealed class ProfileService : IProfileService
             return Result<UsernameChangeRequestDto>.Fail("Profile.SameUsername",
                 "The requested username is the same as your current one.");
 
-        if (await _users.ExistsByUsernameAsync(normalized, ct))
+        if (await _users.ExistsByUsernameAsync(normalized, ct) || await _retiredUsernames.IsRetiredAsync(normalized, ct))
             return Result<UsernameChangeRequestDto>.Fail("Profile.UsernameTaken",
                 "That username is already in use.");
 
@@ -361,7 +636,8 @@ public sealed class ProfileService : IProfileService
     {
         var links = await _profiles.GetLinksByUserIdAsync(user.Id, ct);
         var interests = await _profiles.GetInterestsByUserIdAsync(user.Id, ct);
-        return Result<ProfileDto>.Ok(await ToDtoAsync(user, links, interests, ct));
+        var friendCount = await _friends.GetFriendCountAsync(user.Id, ct);
+        return Result<ProfileDto>.Ok(await ToDtoAsync(user, links, interests, friendCount, ct));
     }
 
     private static UsernameChangeRequestDto ToRequestDto(UsernameChangeRequest r) => new(
@@ -374,6 +650,7 @@ public sealed class ProfileService : IProfileService
         User user,
         IReadOnlyList<ProfileExternalLink> links,
         IReadOnlyList<ProfileInterestTag> interests,
+        int friendCount,
         CancellationToken ct)
     {
         var readExpiry = TimeSpan.FromMinutes(_storageOptions.ReadUrlExpiryMinutes);
@@ -403,6 +680,7 @@ public sealed class ProfileService : IProfileService
             Role: user.Role.ToString(),
             Level: user.Level,
             Elo: user.Elo,
+            FriendCount: friendCount,
             JoinedAt: user.CreatedAt,
             Links: links.Select(ToLinkDto).ToList(),
             Interests: interests.Select(t => t.Name).ToList());
@@ -410,6 +688,41 @@ public sealed class ProfileService : IProfileService
 
     private static ExternalLinkDto ToLinkDto(ProfileExternalLink l) => new(
         l.Id, l.Platform, l.Url, l.DisplayLabel, l.SortOrder);
+
+    private static int ClampListLimit(int limit) => limit <= 0 ? DefaultListLimit : Math.Min(limit, MaxListLimit);
+
+    /// <summary>Blank query → all friends (null); otherwise 2–100 normalized chars (leading @ stripped).</summary>
+    private static string? NormalizeListQuery(string? query, out string? error)
+    {
+        error = null;
+        if (query is null) return null;
+        query = query.Trim();
+        if (query.StartsWith('@')) query = query[1..];
+        if (query.Length == 0) return null;
+        if (query.Length < 2 || query.Length > 100)
+        {
+            error = "Search query must be between 2 and 100 characters.";
+            return null;
+        }
+        return query.ToUpperInvariant();
+    }
+
+    private async Task<PublicIdentityDto> ToIdentityDtoAsync(User user, CancellationToken ct)
+    {
+        var avatar = await BuildAvatarUrlAsync(user.AvatarObjectKey, user.AvatarUrl, ct);
+        return new PublicIdentityDto(
+            user.Id, user.Username, user.DisplayName, user.Initials, user.Color, avatar, user.ProfileType.ToString());
+    }
+
+    private async Task<string?> BuildAvatarUrlAsync(string? objectKey, string? fallbackUrl, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(objectKey))
+        {
+            var expiry = TimeSpan.FromMinutes(_storageOptions.ReadUrlExpiryMinutes);
+            return await _storage.CreatePresignedReadUrlAsync(objectKey, expiry, ct);
+        }
+        return fallbackUrl;
+    }
 
     private static string? ExtensionForContentType(string contentType) =>
         contentType.ToLowerInvariant() switch

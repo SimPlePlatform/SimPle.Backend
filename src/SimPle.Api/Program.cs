@@ -1,3 +1,4 @@
+using System.IdentityModel.Tokens.Jwt;
 using System.Net;
 using System.Text;
 using System.Threading.RateLimiting;
@@ -214,8 +215,28 @@ builder.Services.AddRateLimiter(options =>
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
     options.OnRejected = async (context, cancellationToken) =>
     {
+        // Surface Retry-After (seconds) so clients back off precisely (spec: rate limits emit Retry-After).
+        DateTime? retryAfterUtc = null;
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+        {
+            context.HttpContext.Response.Headers.RetryAfter =
+                ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString();
+            retryAfterUtc = DateTime.UtcNow + retryAfter;
+        }
+
+        // Security event (brief: rate-limit rejections are logged with actor, target, action, result).
+        // No correlation-id infrastructure exists in this codebase yet (pre-existing gap, tracked separately).
+        var rateLimitLogger = context.HttpContext.RequestServices
+            .GetRequiredService<ILoggerFactory>().CreateLogger("RateLimiting");
+        var policyName = context.HttpContext.GetEndpoint()?.Metadata
+            .GetMetadata<EnableRateLimitingAttribute>()?.PolicyName;
+        var actor = context.HttpContext.User?.FindFirst(JwtRegisteredClaimNames.Sub)?.Value ?? "Anonymous";
+        rateLimitLogger.LogWarning(
+            "Security: Rate limit exceeded. ActorId={ActorId} Policy={Policy} Path={Path} Action={Action} Result={Result}",
+            actor, policyName ?? "unknown", context.HttpContext.Request.Path.Value, "RateLimitCheck", "Rejected");
+
         await context.HttpContext.Response.WriteAsJsonAsync(new ApiErrorResponse(
-            new ApiErrorDetail("Auth.RateLimitExceeded", "Too many requests. Please try again later.")),
+            new ApiErrorDetail("RateLimit.Exceeded", "Too many requests. Please try again later.", retryAfterUtc)),
             cancellationToken);
     };
     options.AddPolicy("auth-login", context => AuthWindow(context, 5, TimeSpan.FromMinutes(1)));
@@ -229,6 +250,44 @@ builder.Services.AddRateLimiter(options =>
     // Profile mutation: generous but bounded to prevent username enumeration and spam updates.
     options.AddPolicy("profile-update", context => AuthWindow(context, 30, TimeSpan.FromMinutes(1)));
     options.AddPolicy("profile-username", context => AuthWindow(context, 5, TimeSpan.FromMinutes(1)));
+    // Public profile reads: per-account when authenticated, coarse per-IP fallback when anonymous (FriendWindow).
+    options.AddPolicy("profile-public", context => FriendWindow(context, "ppub", 120, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("profile-viewer-context", context => FriendWindow(context, "pctx", 120, TimeSpan.FromMinutes(1)));
+    // Friends/social policies: partition by authenticated subject ID so each account has its own window
+    // (falls back to remote IP for unauthenticated callers, which [Authorize] normally rejects first).
+    // Middleware order below is UseAuthentication() → UseRateLimiter() → UseAuthorization(), so the subject
+    // claim is populated here. Rejections carry Retry-After via OnRejected above.
+    //
+    // The spec's secondary abuse caps are now both enforced: the per-account-target send cap (3/day) is a
+    // durable counter on the Friendship row (see FriendsService.SendFriendRequestAsync), and the discovery/
+    // people-search per-IP cap (120/hour) is enforced below via GlobalLimiter, chained with these per-account
+    // windows so both dimensions must pass.
+    options.AddPolicy("friend-send", context => FriendWindow(context, "fsnd", 10, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("friend-discovery", context => FriendWindow(context, "fdsc", 30, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("friend-suggestions", context => FriendWindow(context, "fsug", 30, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("friend-block", context => FriendWindow(context, "fblk", 20, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("people-search", context => FriendWindow(context, "psrc", 30, TimeSpan.FromMinutes(1)));
+    // Friend/mutual-friend list drill-downs: same generous-but-bounded window as other profile reads.
+    options.AddPolicy("profile-friends", context => FriendWindow(context, "pfrd", 120, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("profile-mutual-friends", context => FriendWindow(context, "pmut", 120, TimeSpan.FromMinutes(1)));
+
+    // Chained per-IP ceiling for discovery/people-search (spec: 30/min/account + 120/hour/IP). Scoped by
+    // request path so it only "bites" on these two routes; every other route gets a permanent no-op lease.
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
+    {
+        var path = context.Request.Path;
+        if (!path.StartsWithSegments("/api/people/search") && !path.StartsWithSegments("/api/friends/discovery"))
+            return RateLimitPartition.GetNoLimiter("no-limit");
+
+        var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return RateLimitPartition.GetFixedWindowLimiter($"people-ip:{ip}", _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 120,
+            Window = TimeSpan.FromHours(1),
+            QueueLimit = 0,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+        });
+    });
 });
 
 var app = builder.Build();
@@ -252,8 +311,8 @@ if (app.Environment.IsDevelopment())
 if (!app.Environment.IsDevelopment())
     app.UseHttpsRedirection();
 app.UseCors("AllowFrontend");
-app.UseRateLimiter();
-app.UseAuthentication();
+app.UseAuthentication();   // parses JWT cookie and populates User.Identity
+app.UseRateLimiter();      // can now read authenticated subject claim for per-user partitions
 app.UseAuthorization();
 
 app.MapControllers();
@@ -269,6 +328,25 @@ static RateLimitPartition<string> AuthWindow(HttpContext context, int permitLimi
             QueueLimit = 0,
             QueueProcessingOrder = QueueProcessingOrder.OldestFirst
         });
+
+// Per-account fixed window for friends/social endpoints. Keyed by the JWT subject claim; unauthenticated
+// callers fall back to a per-IP partition under the same quota.
+static RateLimitPartition<string> FriendWindow(HttpContext context, string prefix, int permitLimit, TimeSpan window)
+{
+    var sub = context.User?.FindFirst(JwtRegisteredClaimNames.Sub)?.Value;
+    var key = sub is not null
+        ? $"{prefix}:{sub}"
+        : $"{prefix}-ip:{context.Connection.RemoteIpAddress}";
+    return RateLimitPartition.GetFixedWindowLimiter(
+        key,
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = permitLimit,
+            Window = window,
+            QueueLimit = 0,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+        });
+}
 
 app.Run();
 

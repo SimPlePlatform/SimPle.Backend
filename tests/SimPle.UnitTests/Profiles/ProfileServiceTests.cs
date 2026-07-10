@@ -1,9 +1,12 @@
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using NSubstitute;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
+using SimPle.Application.Common.Pagination;
 using SimPle.Application.Profiles.DTOs;
+using SimPle.Domain.Friends;
 using SimPle.Domain.Profiles;
 using SimPle.Application.Profiles.Services;
 using SimPle.Application.Profiles.Validators;
@@ -16,7 +19,10 @@ public sealed class ProfileServiceTests
     private readonly IUserRepository _users = Substitute.For<IUserRepository>();
     private readonly IProfileRepository _profiles = Substitute.For<IProfileRepository>();
     private readonly IUsernameChangeRequestRepository _usernameRequests = Substitute.For<IUsernameChangeRequestRepository>();
+    private readonly IRetiredUsernameRepository _retiredUsernames = Substitute.For<IRetiredUsernameRepository>();
     private readonly IFileStorageService _storage = Substitute.For<IFileStorageService>();
+    private readonly IFriendRepository _friends = Substitute.For<IFriendRepository>();
+    private readonly ILogger<ProfileService> _logger = Substitute.For<ILogger<ProfileService>>();
     private readonly ProfileService _service;
     private readonly StorageOptions _storageOptions = new()
     {
@@ -37,7 +43,13 @@ public sealed class ProfileServiceTests
         _storage.CreatePresignedReadUrlAsync(Arg.Any<string>(), Arg.Any<TimeSpan>())
             .Returns(x => $"https://read.example.test/{x.ArgAt<string>(0)}");
         _storage.ObjectExistsAsync(Arg.Any<string>()).Returns(true);
-        _service = new ProfileService(_users, _profiles, _usernameRequests, _storage, Options.Create(_storageOptions));
+        // Default: not blocked, not friends, 0 friend count
+        _friends.IsBlockedInEitherDirectionAsync(Arg.Any<Guid>(), Arg.Any<Guid>()).Returns(false);
+        _friends.AreFriendsAsync(Arg.Any<Guid>(), Arg.Any<Guid>()).Returns(false);
+        _friends.GetFriendCountAsync(Arg.Any<Guid>()).Returns(0);
+        _retiredUsernames.IsRetiredAsync(Arg.Any<string>()).Returns(false);
+        _service = new ProfileService(
+            _users, _profiles, _usernameRequests, _retiredUsernames, _storage, Options.Create(_storageOptions), _friends, _logger);
     }
 
     private static User MakeUser(string username = "testuser") =>
@@ -95,7 +107,7 @@ public sealed class ProfileServiceTests
         var result = await _service.GetPublicProfileAsync("testuser", Guid.NewGuid());
 
         result.IsSuccess.Should().BeFalse();
-        result.Error!.Code.Should().Be("Profile.Private");
+        result.Error!.Code.Should().Be("Profile.NotVisible");
     }
 
     [Fact]
@@ -111,16 +123,85 @@ public sealed class ProfileServiceTests
     }
 
     [Fact]
-    public async Task GetPublicProfile_FriendsOnly_TreatedAsOwnerOnly()
+    public async Task GetPublicProfile_FriendsOnly_StrangerDenied()
+    {
+        var user = MakeUser();
+        user.UpdateProfile("Test", null, visibility: ProfileVisibility.FriendsOnly);
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        // Default mock: AreFriendsAsync returns false
+
+        var result = await _service.GetPublicProfileAsync("testuser", Guid.NewGuid());
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetPublicProfile_FriendsOnly_Friend_Visible()
+    {
+        var user = MakeUser();
+        user.UpdateProfile("Test", null, visibility: ProfileVisibility.FriendsOnly);
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var requesterId = Guid.NewGuid();
+        _friends.AreFriendsAsync(user.Id, requesterId).Returns(true);
+
+        var result = await _service.GetPublicProfileAsync("testuser", requesterId);
+
+        result.IsSuccess.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task GetPublicProfile_FriendsOnly_NullRequester_Denied()
     {
         var user = MakeUser();
         user.UpdateProfile("Test", null, visibility: ProfileVisibility.FriendsOnly);
         _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
 
+        var result = await _service.GetPublicProfileAsync("testuser", null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetPublicProfile_Blocked_ReturnsNotVisible()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var requesterId = Guid.NewGuid();
+        _friends.IsBlockedInEitherDirectionAsync(user.Id, requesterId).Returns(true);
+
+        var result = await _service.GetPublicProfileAsync("testuser", requesterId);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetPublicProfile_SuspendedUser_ReturnsNotVisible()
+    {
+        var user = MakeUser();
+        user.Suspend();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+
         var result = await _service.GetPublicProfileAsync("testuser", Guid.NewGuid());
 
         result.IsSuccess.Should().BeFalse();
-        result.Error!.Code.Should().Be("Profile.FriendsOnly");
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task BuildProfileDto_IncludesFriendCount()
+    {
+        var user = MakeUser();
+        _users.GetByIdAsync(user.Id).Returns(user);
+        _friends.GetFriendCountAsync(user.Id).Returns(7);
+
+        var result = await _service.GetMyProfileAsync(user.Id);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.FriendCount.Should().Be(7);
+        await _friends.Received(1).GetFriendCountAsync(user.Id);
     }
 
     [Fact]
@@ -131,7 +212,414 @@ public sealed class ProfileServiceTests
         var result = await _service.GetPublicProfileAsync("ghost", null);
 
         result.IsSuccess.Should().BeFalse();
-        result.Error!.Code.Should().Be("General.NotFound");
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    // ── GetViewerContext ─────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetViewerContext_Self_ReturnsSelfWithEditActions()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+
+        var result = await _service.GetViewerContextAsync("testuser", user.Id);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.RelationshipState.Should().Be("Self");
+        result.Value.AllowedActions.Should().Contain("edit");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_Stranger_ReturnsNoneWithAddFriendAction()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+
+        var result = await _service.GetViewerContextAsync("testuser", viewerId);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.RelationshipState.Should().Be("None");
+        result.Value.AllowedActions.Should().Contain("add_friend");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_Friends_ReturnsFriendsState()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.AreFriendsAsync(user.Id, viewerId).Returns(true);
+
+        var result = await _service.GetViewerContextAsync("testuser", viewerId);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.RelationshipState.Should().Be("Friends");
+        result.Value.AllowedActions.Should().Contain("remove");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_OutgoingPending_ViewerIsRequester()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.GetEdgeAsync(user.Id, viewerId).Returns(Friendship.Request(viewerId, user.Id));
+
+        var result = await _service.GetViewerContextAsync("testuser", viewerId);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.RelationshipState.Should().Be("OutgoingPending");
+        result.Value.AllowedActions.Should().Contain("cancel");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_IncomingPending_TargetIsRequester()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.GetEdgeAsync(user.Id, viewerId).Returns(Friendship.Request(user.Id, viewerId));
+
+        var result = await _service.GetViewerContextAsync("testuser", viewerId);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.RelationshipState.Should().Be("IncomingPending");
+        result.Value.AllowedActions.Should().Contain("accept");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_ViewerBlockedTarget_ReturnsBlockedBySelf_BypassingPrivateVisibility()
+    {
+        var user = MakeUser();
+        user.UpdateProfile(user.DisplayName, user.Bio, visibility: ProfileVisibility.Private);
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.GetBlockAsync(viewerId, user.Id).Returns(Block.Create(viewerId, user.Id));
+
+        var result = await _service.GetViewerContextAsync("testuser", viewerId);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.RelationshipState.Should().Be("BlockedBySelf");
+        result.Value.AllowedActions.Should().Contain("unblock");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_TargetBlockedViewer_ReturnsNotVisible()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.GetBlockAsync(user.Id, viewerId).Returns(Block.Create(user.Id, viewerId));
+
+        var result = await _service.GetViewerContextAsync("testuser", viewerId);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_SuspendedTarget_ReturnsNotVisible()
+    {
+        var user = MakeUser();
+        user.Suspend();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+
+        var result = await _service.GetViewerContextAsync("testuser", Guid.NewGuid());
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_NotFound_ReturnsNotVisible()
+    {
+        _users.GetByNormalizedUsernameAsync(Arg.Any<string>()).Returns((User?)null);
+
+        var result = await _service.GetViewerContextAsync("ghost", Guid.NewGuid());
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetViewerContext_FriendsListOnlyMe_HidesFriendCount()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.OnlyMe);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+
+        var result = await _service.GetViewerContextAsync("testuser", viewerId);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.CanViewFriends.Should().BeFalse();
+        result.Value.VisibleFriendCount.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetViewerContext_FriendsListEveryone_ExposesVisibleFriendCount()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.Everyone);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+        _friends.GetVisibleFriendCountAsync(user.Id, viewerId).Returns(3);
+
+        var result = await _service.GetViewerContextAsync("testuser", viewerId);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.CanViewFriends.Should().BeTrue();
+        result.Value.VisibleFriendCount.Should().Be(3);
+    }
+
+    // ── GetFriendsList ────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetFriendsList_AnonymousPublicEveryone_ReturnsPage()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.Everyone);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+        var friend = MakeUser("carol");
+        _friends.GetVisibleFriendsPageAsync(user.Id, Guid.Empty, null, 20, null, null)
+            .Returns(new List<User> { friend });
+
+        var result = await _service.GetFriendsListAsync("testuser", null, null, 20, null);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.Items.Should().ContainSingle(i => i.Username == "carol");
+        result.Value.NextCursor.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetFriendsList_AnonymousDefaultFriendsOnlyVisibility_NotVisible()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        _friends.GetSettingsAsync(user.Id).Returns((UserFriendSettings?)null);   // default FriendsListVisibility.Friends
+
+        var result = await _service.GetFriendsListAsync("testuser", null, null, 20, null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetFriendsList_AnonymousFriendsOnlyBaseProfile_NotVisibleEvenWithEveryoneList()
+    {
+        var user = MakeUser();
+        user.UpdateProfile(user.DisplayName, user.Bio, visibility: ProfileVisibility.FriendsOnly);
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.Everyone);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+
+        var result = await _service.GetFriendsListAsync("testuser", null, null, 20, null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetFriendsList_AuthenticatedNonFriendDefaultVisibility_NotVisible()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.GetSettingsAsync(user.Id).Returns((UserFriendSettings?)null);   // default Friends
+        _friends.AreFriendsAsync(user.Id, viewerId).Returns(false);
+
+        var result = await _service.GetFriendsListAsync("testuser", viewerId, null, 20, null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetFriendsList_AuthenticatedFriend_ReturnsPageIgnoringPrivateBaseProfile()
+    {
+        var user = MakeUser();
+        user.UpdateProfile(user.DisplayName, user.Bio, visibility: ProfileVisibility.Private);
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.AreFriendsAsync(user.Id, viewerId).Returns(true);   // default FriendsListVisibility.Friends
+        var friend = MakeUser("carol");
+        _friends.GetVisibleFriendsPageAsync(user.Id, viewerId, null, 20, null, null)
+            .Returns(new List<User> { friend });
+
+        var result = await _service.GetFriendsListAsync("testuser", viewerId, null, 20, null);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.Items.Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task GetFriendsList_Self_ReturnsPageRegardlessOfOnlyMeSetting()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.OnlyMe);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+        _friends.GetVisibleFriendsPageAsync(user.Id, user.Id, null, 20, null, null)
+            .Returns(new List<User>());
+
+        var result = await _service.GetFriendsListAsync("testuser", user.Id, null, 20, null);
+
+        result.IsSuccess.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task GetFriendsList_BlockedEitherDirection_NotVisible()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.Everyone);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+        _friends.IsBlockedInEitherDirectionAsync(user.Id, viewerId).Returns(true);
+
+        var result = await _service.GetFriendsListAsync("testuser", viewerId, null, 20, null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetFriendsList_QueryTooShort_ValidationFailed()
+    {
+        var result = await _service.GetFriendsListAsync("testuser", null, "a", 20, null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Validation.Failed");
+    }
+
+    [Fact]
+    public async Task GetFriendsList_CursorWrongListContext_InvalidCursor()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.Everyone);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+        var mutualCursor = Cursor.EncodeProfileList(
+            "CAROL", Guid.NewGuid(), user.Id, string.Empty, settings.PrivacyPolicyVersion, "mutual");
+
+        var result = await _service.GetFriendsListAsync("testuser", null, null, 20, mutualCursor);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Pagination.InvalidCursor");
+    }
+
+    [Fact]
+    public async Task GetFriendsList_FullPage_EncodesNextCursor()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.Everyone);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+        var friend = MakeUser("carol");
+        _friends.GetVisibleFriendsPageAsync(user.Id, Guid.Empty, null, 1, null, null)
+            .Returns(new List<User> { friend });
+
+        var result = await _service.GetFriendsListAsync("testuser", null, null, 1, null);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.NextCursor.Should().NotBeNull();
+    }
+
+    // ── GetMutualFriendsList ──────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetMutualFriendsList_NonFriendDefaultVisibility_NotVisible()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.GetSettingsAsync(user.Id).Returns((UserFriendSettings?)null);   // default Friends
+        _friends.AreFriendsAsync(user.Id, viewerId).Returns(false);
+
+        var result = await _service.GetMutualFriendsListAsync("testuser", viewerId, 20, null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetMutualFriendsList_Friend_ReturnsPage()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.AreFriendsAsync(user.Id, viewerId).Returns(true);
+        var mutual = MakeUser("dave");
+        _friends.GetVisibleMutualFriendsPageAsync(viewerId, user.Id, 20, null, null)
+            .Returns(new List<User> { mutual });
+
+        var result = await _service.GetMutualFriendsListAsync("testuser", viewerId, 20, null);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value!.Items.Should().ContainSingle(i => i.Username == "dave");
+    }
+
+    [Fact]
+    public async Task GetMutualFriendsList_EveryoneVisibilityNonFriend_ReturnsPage()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.Everyone);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+        _friends.GetVisibleMutualFriendsPageAsync(viewerId, user.Id, 20, null, null)
+            .Returns(new List<User>());
+
+        var result = await _service.GetMutualFriendsListAsync("testuser", viewerId, 20, null);
+
+        result.IsSuccess.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task GetMutualFriendsList_BlockedEitherDirection_NotVisible()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        var settings = UserFriendSettings.CreateDefault(user.Id);
+        settings.UpdateSettings(FriendRequestPrivacy.Anyone, null, FriendsListVisibility.Everyone);
+        _friends.GetSettingsAsync(user.Id).Returns(settings);
+        _friends.IsBlockedInEitherDirectionAsync(user.Id, viewerId).Returns(true);
+
+        var result = await _service.GetMutualFriendsListAsync("testuser", viewerId, 20, null);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.NotVisible");
+    }
+
+    [Fact]
+    public async Task GetMutualFriendsList_CursorWrongListContext_InvalidCursor()
+    {
+        var user = MakeUser();
+        _users.GetByNormalizedUsernameAsync("TESTUSER").Returns(user);
+        var viewerId = Guid.NewGuid();
+        _friends.AreFriendsAsync(user.Id, viewerId).Returns(true);
+        var friendsCursor = Cursor.EncodeProfileList(
+            "DAVE", Guid.NewGuid(), user.Id, string.Empty, 1, "friends");
+
+        var result = await _service.GetMutualFriendsListAsync("testuser", viewerId, 20, friendsCursor);
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Pagination.InvalidCursor");
     }
 
     // ── UpdateProfile ─────────────────────────────────────────────────────────
@@ -201,6 +689,35 @@ public sealed class ProfileServiceTests
 
         result.IsSuccess.Should().BeFalse();
         result.Error!.Code.Should().Be("Profile.UsernameTaken");
+    }
+
+    [Fact]
+    public async Task UpdateUsername_RetiredName_Fails()
+    {
+        var user = MakeUser();
+        _users.GetByIdAsync(user.Id).Returns(user);
+        _users.ExistsByUsernameAsync(Arg.Any<string>()).Returns(false);
+        _retiredUsernames.IsRetiredAsync("RETIREDNAME").Returns(true);
+
+        var result = await _service.UpdateUsernameAsync(user.Id, "retiredname");
+
+        result.IsSuccess.Should().BeFalse();
+        result.Error!.Code.Should().Be("Profile.UsernameTaken");
+        await _users.DidNotReceive().UpdateAsync(Arg.Any<User>());
+    }
+
+    [Fact]
+    public async Task UpdateUsername_Success_RetiresPreviousHandle()
+    {
+        var user = MakeUser("oldhandle");
+        _users.GetByIdAsync(user.Id).Returns(user);
+        _users.ExistsByUsernameAsync("NEWHANDLE").Returns(false);
+
+        var result = await _service.UpdateUsernameAsync(user.Id, "newhandle");
+
+        result.IsSuccess.Should().BeTrue();
+        await _retiredUsernames.Received(1).AddAsync(Arg.Is<RetiredUsername>(r =>
+            r.NormalizedUsername == "OLDHANDLE" && r.PriorOwnerUserId == user.Id));
     }
 
     [Fact]

@@ -249,6 +249,88 @@ public sealed class AccountSecurityEndpointsTests : IDisposable
         login.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
     }
 
+    // ── Account deletion cascade with friends & blocks ───────────────────────
+
+    [Fact]
+    public async Task DeleteAccount_WithFriendshipsAndBlocks_OtherUsersUnaffected()
+    {
+        // Register three users: A (to be deleted), B, and C.
+        using var clientA = CreateClient();
+        var (emailA, usernameA) = UniqueUser();
+        await RegisterAndLoginAsync(clientA, emailA, usernameA);
+
+        using var clientB = CreateClient();
+        var (emailB, usernameB) = UniqueUser();
+        await RegisterAndLoginAsync(clientB, emailB, usernameB);
+
+        using var clientC = CreateClient();
+        var (emailC, usernameC) = UniqueUser();
+        await RegisterAndLoginAsync(clientC, emailC, usernameC);
+
+        async Task<Guid> GetUserId(HttpClient from, string targetUsername)
+        {
+            var r = await from.GetAsync($"/api/profile/{targetUsername}");
+            var j = System.Text.Json.JsonDocument.Parse(await r.Content.ReadAsStringAsync());
+            return j.RootElement.GetProperty("userId").GetGuid();
+        }
+
+        async Task<Guid> GetIncomingRequestId(HttpClient addresseeClient, string requesterUsername)
+        {
+            var r = await addresseeClient.GetAsync("/api/friends/requests?direction=incoming");
+            var j = System.Text.Json.JsonDocument.Parse(await r.Content.ReadAsStringAsync());
+            var items = j.RootElement.GetProperty("items");
+            for (int i = 0; i < items.GetArrayLength(); i++)
+            {
+                var item = items[i];
+                if (item.GetProperty("requesterUsername").GetString() == requesterUsername)
+                    return item.GetProperty("requestId").GetGuid();
+            }
+            throw new InvalidOperationException($"No incoming request from {requesterUsername}");
+        }
+
+        var userBId = await GetUserId(clientA, usernameB);
+        var userCId = await GetUserId(clientA, usernameC);
+
+        // A → B: A is RequesterId; B accepts as AddresseeId
+        await clientA.PostAsJsonAsync("/api/friends/requests", new { TargetUserId = userBId });
+        var reqAB = await GetIncomingRequestId(clientB, usernameA);
+        await clientB.PostAsJsonAsync($"/api/friends/requests/{reqAB}/accept", (object?)null);
+
+        // B → C: B is RequesterId; C accepts as AddresseeId (tests AddresseeId cascade role)
+        var userCIdFromB = await GetUserId(clientB, usernameC);
+        await clientB.PostAsJsonAsync("/api/friends/requests", new { TargetUserId = userCIdFromB });
+        var reqBC = await GetIncomingRequestId(clientC, usernameB);
+        await clientC.PostAsJsonAsync($"/api/friends/requests/{reqBC}/accept", (object?)null);
+
+        // A blocks C (A is BlockerId)
+        await clientA.PostAsJsonAsync("/api/friends/blocks", new { TargetUserId = userCId });
+
+        // A sets custom privacy (exercises user_friend_settings row creation)
+        await clientA.PutAsJsonAsync("/api/friends/settings", new { FriendRequestPrivacy = "FriendsOfFriends" });
+
+        // Delete A's account
+        var deleteResp = await clientA.SendAsync(new HttpRequestMessage(HttpMethod.Delete, "/api/auth/account")
+        {
+            Content = JsonContent.Create(new { Password = TestPassword })
+        });
+        deleteResp.StatusCode.Should().Be(HttpStatusCode.NoContent);
+
+        // A's profile is gone — 404
+        using var anonClient = CreateClient();
+        (await anonClient.GetAsync($"/api/profile/{usernameA}")).StatusCode
+            .Should().Be(HttpStatusCode.NotFound);
+
+        // B and C still exist — their profile pages return 200
+        (await anonClient.GetAsync($"/api/profile/{usernameB}")).StatusCode
+            .Should().Be(HttpStatusCode.OK);
+        (await anonClient.GetAsync($"/api/profile/{usernameC}")).StatusCode
+            .Should().Be(HttpStatusCode.OK);
+
+        // B can still access C's profile, confirming the B–C friendship edge is intact
+        (await clientB.GetAsync($"/api/profile/{usernameC}")).StatusCode
+            .Should().Be(HttpStatusCode.OK);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private const string TestPassword = "ValidPassword1";

@@ -39,6 +39,8 @@ public static class DependencyInjection
         services.AddScoped<IGoogleTokenValidationService, GoogleTokenValidationService>();
         services.AddScoped<IProfileRepository, ProfileRepository>();
         services.AddScoped<IUsernameChangeRequestRepository, UsernameChangeRequestRepository>();
+        services.AddScoped<IRetiredUsernameRepository, RetiredUsernameRepository>();
+        services.AddScoped<IFriendRepository, FriendRepository>();
         services.Configure<StorageOptions>(configuration.GetSection(StorageOptions.SectionName));
         services.PostConfigure<StorageOptions>(options =>
         {
@@ -50,6 +52,10 @@ public static class DependencyInjection
         services.Configure<TokenCleanupOptions>(
             configuration.GetSection(TokenCleanupOptions.SectionName));
         services.AddHostedService<TokenCleanupService>();
+
+        services.Configure<DismissedSuggestionCleanupOptions>(
+            configuration.GetSection(DismissedSuggestionCleanupOptions.SectionName));
+        services.AddHostedService<DismissedSuggestionCleanupService>();
 
         return services;
     }

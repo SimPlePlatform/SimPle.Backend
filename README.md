@@ -65,7 +65,7 @@ ASP.NET Core 8 backend for the SimPle multiplayer game platform.
 dotnet test
 ```
 
-145 tests total: 100 unit tests, 45 integration tests.
+373 tests total: 217 unit tests, 156 integration tests.
 
 ## CI
 

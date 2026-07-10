@@ -1,4 +1,6 @@
 using Microsoft.EntityFrameworkCore;
+using SimPle.Domain.Friends;
+using SimPle.Domain.Outbox;
 using SimPle.Domain.Profiles;
 using SimPle.Domain.Users;
 
@@ -17,6 +19,17 @@ public class AppDbContext : DbContext
     public DbSet<ProfileExternalLink> ProfileExternalLinks => Set<ProfileExternalLink>();
     public DbSet<ProfileInterestTag> ProfileInterestTags => Set<ProfileInterestTag>();
     public DbSet<UsernameChangeRequest> UsernameChangeRequests => Set<UsernameChangeRequest>();
+    public DbSet<RetiredUsername> RetiredUsernames => Set<RetiredUsername>();
+
+    // Module 3 — friends & social graph
+    public DbSet<Friendship> Friendships => Set<Friendship>();
+    public DbSet<Block> Blocks => Set<Block>();
+    public DbSet<UserFriendSettings> UserFriendSettings => Set<UserFriendSettings>();
+    public DbSet<DismissedFriendSuggestion> DismissedFriendSuggestions => Set<DismissedFriendSuggestion>();
+
+    // Module 3 — transactional integration-event outbox (consumed by M7/M10/M11)
+    public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
+    public DbSet<OutboxDelivery> OutboxDeliveries => Set<OutboxDelivery>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
