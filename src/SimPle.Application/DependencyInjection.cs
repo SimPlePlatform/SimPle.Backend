@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using SimPle.Application.Auth.Services;
 using SimPle.Application.Friends.Services;
+using SimPle.Application.GameHost.Services;
 using SimPle.Application.Games.Services;
 using SimPle.Application.People.Services;
 using SimPle.Application.Profiles.Services;
@@ -16,6 +17,12 @@ public static class DependencyInjection
         services.AddScoped<IFriendsService, FriendsService>();
         services.AddScoped<IPeopleService, PeopleService>();
         services.AddScoped<IGamesService, GamesService>();
+
+        // IGameRegistry is registered separately by the composition root: building it requires the list of
+        // installed IHostedGameDefinition instances, which is composition-root knowledge (currently empty —
+        // no Phase 2 game is hosted yet), not something this generic module wiring can supply.
+        services.AddScoped<IGameHostInvoker, GameHostInvoker>();
+        services.AddScoped<ICatalogEngineCompatibilityValidator, CatalogEngineCompatibilityValidator>();
 
         return services;
     }

@@ -8,6 +8,7 @@ using FluentValidation.AspNetCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
 using Microsoft.IdentityModel.Tokens;
@@ -18,6 +19,8 @@ using SimPle.Application;
 using SimPle.Application.Auth.Validators;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
+using SimPle.Application.GameHost.Services;
+using SimPle.Domain.GameHost;
 using SimPle.Infrastructure;
 using SimPle.Infrastructure.Auth;
 using SimPle.Infrastructure.Games;
@@ -70,6 +73,12 @@ builder.Services.AddFluentValidationAutoValidation();
 builder.Services.AddValidatorsFromAssemblyContaining<RegisterRequestValidator>();
 builder.Services.AddApplicationServices();
 builder.Services.AddInfrastructureServices(builder.Configuration);
+
+// The composition root's list of installed Phase 2 game engines. Empty today — Module 5 hosts no product
+// game yet, only the test-only HiddenTokenDraft reference engine, which is never registered here. A duplicate
+// (Slug, EngineVersion) across two real entries throws from Create() and fails application startup, never a
+// call-time ambiguity.
+builder.Services.AddSingleton<IGameRegistry>(_ => GameRegistry.Create(Array.Empty<IHostedGameDefinition>()));
 
 builder.Services.AddOptions<JwtSettings>()
     .Bind(builder.Configuration.GetSection(JwtSettings.SectionName))
@@ -315,6 +324,40 @@ builder.Services.AddRateLimiter(options =>
 });
 
 var app = builder.Build();
+
+// Fail-fast: every installed game engine must agree with its Module 4 catalog row on player bounds and
+// modes, or a lobby could advertise a match shape the engine will reject at runtime. Skipped entirely (no DB
+// round trip) while zero engines are installed, which is the current state and also keeps WebApplicationFactory
+// integration tests that don't touch GameHost from needing a live database just to boot the app.
+using (var startupScope = app.Services.CreateScope())
+{
+    var gameRegistry = startupScope.ServiceProvider.GetRequiredService<IGameRegistry>();
+    if (gameRegistry.RegisteredDefinitions.Count > 0)
+    {
+        var startupDb = startupScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var games = startupDb.Games.AsNoTracking().ToList();
+        var gameIds = games.Select(g => g.Id).ToList();
+        var modesByGameId = startupDb.GameModeCapabilities.AsNoTracking()
+            .Where(c => gameIds.Contains(c.GameId))
+            .ToList()
+            .GroupBy(c => c.GameId)
+            .ToDictionary(g => g.Key, g => (IEnumerable<string>)g.Select(c => c.Mode).ToList());
+
+        var catalogSnapshots = games.Select(g => CatalogGameSnapshot.Create(
+            g.Slug,
+            g.MinPlayers,
+            g.MaxPlayers,
+            modesByGameId.TryGetValue(g.Id, out var modes) ? modes : Enumerable.Empty<string>()));
+
+        var catalogValidator = startupScope.ServiceProvider.GetRequiredService<ICatalogEngineCompatibilityValidator>();
+        var violations = catalogValidator.Validate(gameRegistry.RegisteredDefinitions, catalogSnapshots);
+        if (violations.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "Game engine / catalog compatibility check failed at startup: " + string.Join("; ", violations));
+        }
+    }
+}
 
 // Must be first — sets RemoteIpAddress from X-Forwarded-For before any other middleware reads it.
 app.UseForwardedHeaders();
