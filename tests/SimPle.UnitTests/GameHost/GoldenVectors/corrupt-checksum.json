@@ -1,0 +1,16 @@
+{
+  "scenario": "corrupt-checksum",
+  "envelope": {
+    "gameSlug": "hidden-token-draft-reference",
+    "engineVersion": 1,
+    "stateSchemaVersion": 1,
+    "revision": 3,
+    "rngAlgorithm": "PCG32-v1",
+    "rngState": 6002397479510801052,
+    "rngInc": 18282773015276577825,
+    "rngCursor": 3,
+    "stateBytesBase64": "eyJzZWF0Q291bnQiOjMsImN1cnJlbnRTZWF0IjowLCJjb25zZWN1dGl2ZVBhc3NlcyI6MCwiZGVja1Rva2VucyI6WzEsMiw0LDUsNiw3LDksMTEsMTIsMTMsMTQsMTUsMTYsMTcsMThdLCJoYW5kcyI6W1szXSxbOF0sWzEwXV19",
+    "checksumSha256Hex": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "expectedErrorCode": "Engine.CorruptState"
+}

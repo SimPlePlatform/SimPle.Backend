@@ -1,0 +1,11 @@
+{
+  "accepted": false,
+  "priorRevision": 1,
+  "nextRevision": 1,
+  "rejectionCode": "Engine.IllegalActor",
+  "rejectionDetail": "It is not this seat\u0027s turn.",
+  "nextState": null,
+  "publicEventTypes": [],
+  "privateEventTypes": [],
+  "engineState": "InProgress"
+}

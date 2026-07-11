@@ -30,4 +30,10 @@
     <ProjectReference Include="..\..\src\SimPle.Infrastructure\SimPle.Infrastructure.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Committed golden-vector JSON files must land next to the test assembly so GoldenVectorTests can read
+         them at run time without any repo-root path discovery. -->
+    <None Include="GameHost\GoldenVectors\*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

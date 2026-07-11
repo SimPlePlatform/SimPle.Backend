@@ -27,6 +27,11 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\SimPle.Api\SimPle.Api.csproj" />
+
+    <!-- Reuses the test-only HiddenTokenDraft reference engine (tests/SimPle.UnitTests/GameHost/Reference) so
+         the Module 5 M8-boundary integration tests exercise the exact same engine as the unit tests, instead of
+         duplicating a second copy that could silently drift from it. -->
+    <ProjectReference Include="..\SimPle.UnitTests\SimPle.UnitTests.csproj" />
   </ItemGroup>
 
 </Project>
