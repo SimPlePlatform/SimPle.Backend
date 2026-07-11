@@ -1,0 +1,24 @@
+{
+  "accepted": true,
+  "priorRevision": 0,
+  "nextRevision": 1,
+  "rejectionCode": null,
+  "rejectionDetail": null,
+  "nextState": {
+    "gameSlug": "hidden-token-draft-reference",
+    "engineVersion": 1,
+    "stateSchemaVersion": 1,
+    "revision": 1,
+    "rngAlgorithm": "PCG32-v1",
+    "rngState": 6574294275608657278,
+    "rngInc": 18282773015276577825,
+    "rngCursor": 1,
+    "stateBytesBase64": "eyJzZWF0Q291bnQiOjMsImN1cnJlbnRTZWF0IjoxLCJjb25zZWN1dGl2ZVBhc3NlcyI6MCwiZGVja1Rva2VucyI6WzEsMiw0LDUsNiw3LDgsOSwxMCwxMSwxMiwxMywxNCwxNSwxNiwxNywxOF0sImhhbmRzIjpbWzNdLFtdLFtdXX0=",
+    "checksumSha256Hex": "d9803e2e1bb0bf7680096a66df473f80370eb71c1889d2521686262e7141573a"
+  },
+  "publicEventTypes": [
+    "TokenDrawn"
+  ],
+  "privateEventTypes": [],
+  "engineState": "InProgress"
+}

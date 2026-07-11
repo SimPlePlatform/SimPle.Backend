@@ -1,0 +1,12 @@
+{
+  "gameSlug": "hidden-token-draft-reference",
+  "engineVersion": 1,
+  "stateSchemaVersion": 1,
+  "revision": 0,
+  "rngAlgorithm": "PCG32-v1",
+  "rngState": 10126853245685670129,
+  "rngInc": 18282773015276577825,
+  "rngCursor": 0,
+  "stateBytesBase64": "eyJzZWF0Q291bnQiOjMsImN1cnJlbnRTZWF0IjowLCJjb25zZWN1dGl2ZVBhc3NlcyI6MCwiZGVja1Rva2VucyI6WzEsMiwzLDQsNSw2LDcsOCw5LDEwLDExLDEyLDEzLDE0LDE1LDE2LDE3LDE4XSwiaGFuZHMiOltbXSxbXSxbXV19",
+  "checksumSha256Hex": "ff16b3116796e5b68404f1b4cd2cec1e2b4a10b2da12aa736c7ce9df970a170a"
+}
