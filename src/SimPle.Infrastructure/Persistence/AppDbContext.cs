@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using SimPle.Domain.Friends;
+using SimPle.Domain.Games;
 using SimPle.Domain.Outbox;
 using SimPle.Domain.Profiles;
 using SimPle.Domain.Users;
@@ -30,6 +31,13 @@ public class AppDbContext : DbContext
     // Module 3 — transactional integration-event outbox (consumed by M7/M10/M11)
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
     public DbSet<OutboxDelivery> OutboxDeliveries => Set<OutboxDelivery>();
+
+    // Module 4 — game library & discovery
+    public DbSet<Game> Games => Set<Game>();
+    public DbSet<GameTag> GameTags => Set<GameTag>();
+    public DbSet<GameModeCapability> GameModeCapabilities => Set<GameModeCapability>();
+    public DbSet<UserFavoriteGame> UserFavoriteGames => Set<UserFavoriteGame>();
+    public DbSet<CatalogSeedHistory> CatalogSeedHistory => Set<CatalogSeedHistory>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

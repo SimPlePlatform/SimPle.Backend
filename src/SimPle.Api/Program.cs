@@ -20,6 +20,8 @@ using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
 using SimPle.Infrastructure;
 using SimPle.Infrastructure.Auth;
+using SimPle.Infrastructure.Games;
+using SimPle.Infrastructure.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -271,22 +273,44 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("profile-friends", context => FriendWindow(context, "pfrd", 120, TimeSpan.FromMinutes(1)));
     options.AddPolicy("profile-mutual-friends", context => FriendWindow(context, "pmut", 120, TimeSpan.FromMinutes(1)));
 
-    // Chained per-IP ceiling for discovery/people-search (spec: 30/min/account + 120/hour/IP). Scoped by
-    // request path so it only "bites" on these two routes; every other route gets a permanent no-op lease.
+    // Game catalog policies (per IP for anonymous public reads; per account, IP-fallback for favorites).
+    options.AddPolicy("catalog-read", context => AuthWindow(context, 120, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("game-favorites", context => FriendWindow(context, "gfav", 60, TimeSpan.FromMinutes(1)));
+
+    // Chained per-IP ceiling for discovery/people-search (spec: 30/min/account + 120/hour/IP), and for
+    // catalog search (spec: 120/min/IP catalog-read + 30/min/IP catalog-search when `query` is present).
+    // Scoped by request path/query so it only "bites" on these routes; every other route gets a permanent
+    // no-op lease.
     options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
     {
         var path = context.Request.Path;
-        if (!path.StartsWithSegments("/api/people/search") && !path.StartsWithSegments("/api/friends/discovery"))
-            return RateLimitPartition.GetNoLimiter("no-limit");
-
         var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-        return RateLimitPartition.GetFixedWindowLimiter($"people-ip:{ip}", _ => new FixedWindowRateLimiterOptions
+
+        if (path.StartsWithSegments("/api/people/search") || path.StartsWithSegments("/api/friends/discovery"))
         {
-            PermitLimit = 120,
-            Window = TimeSpan.FromHours(1),
-            QueueLimit = 0,
-            QueueProcessingOrder = QueueProcessingOrder.OldestFirst
-        });
+            return RateLimitPartition.GetFixedWindowLimiter($"people-ip:{ip}", _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 120,
+                Window = TimeSpan.FromHours(1),
+                QueueLimit = 0,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+            });
+        }
+
+        if (HttpMethods.IsGet(context.Request.Method) &&
+            path.StartsWithSegments("/api/games", out var remaining) && remaining == PathString.Empty &&
+            !string.IsNullOrEmpty(context.Request.Query["query"]))
+        {
+            return RateLimitPartition.GetFixedWindowLimiter($"catalog-search-ip:{ip}", _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 30,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+            });
+        }
+
+        return RateLimitPartition.GetNoLimiter("no-limit");
     });
 });
 
@@ -346,6 +370,17 @@ static RateLimitPartition<string> FriendWindow(HttpContext context, string prefi
             QueueLimit = 0,
             QueueProcessingOrder = QueueProcessingOrder.OldestFirst
         });
+}
+
+if (args.Contains("--seed-game-catalog"))
+{
+    using var scope = app.Services.CreateScope();
+    var seedDb = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var seedLogger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger<GameCatalogSeeder>();
+    var seeder = new GameCatalogSeeder(seedDb, seedLogger);
+    var seedResult = seeder.SeedAsync().GetAwaiter().GetResult();
+    Console.WriteLine(seedResult.Message);
+    Environment.Exit(seedResult.Success ? 0 : 1);
 }
 
 app.Run();

@@ -107,6 +107,29 @@ public static class Cursor
         return true;
     }
 
+    // ── Game catalog cursor: (sortKey, Slug) position, bound to a hash of the normalized query shape
+    // (search text, category/tag/mode/lifecycle filters, sort) so a cursor cannot be replayed after the
+    // filter/sort shape changes — it must fail with Pagination.InvalidCursor rather than blend result sets.
+    // sortKey is a caller-formatted, order-preserving string representation of the active sort's key(s)
+    // (e.g. the default order's zero-padded FeaturedRank/SortOrder composite, or the uppercased Name).
+
+    public static string EncodeCatalog(string sortKey, string slug, string queryShapeHash) =>
+        ToBase64Url($"{ToBase64Url(sortKey)}{Sep}{ToBase64Url(slug)}{Sep}{ToBase64Url(queryShapeHash)}");
+
+    public static bool TryDecodeCatalog(string? cursor, out string sortKey, out string slug, out string queryShapeHash)
+    {
+        sortKey = string.Empty;
+        slug = string.Empty;
+        queryShapeHash = string.Empty;
+        if (!TryFromBase64Url(cursor, out var raw)) return false;
+        var parts = raw.Split(Sep);
+        if (parts.Length != 3) return false;
+        if (!TryFromBase64Url(parts[0], out sortKey)) return false;
+        if (!TryFromBase64Url(parts[1], out slug)) return false;
+        if (!TryFromBase64Url(parts[2], out queryShapeHash)) return false;
+        return true;
+    }
+
     // ── base64url (RFC 4648 §5) without external dependencies ──
 
     private static string ToBase64Url(string value)

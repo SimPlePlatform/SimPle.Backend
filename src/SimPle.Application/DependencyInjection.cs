@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using SimPle.Application.Auth.Services;
 using SimPle.Application.Friends.Services;
+using SimPle.Application.Games.Services;
 using SimPle.Application.People.Services;
 using SimPle.Application.Profiles.Services;
 
@@ -14,6 +15,7 @@ public static class DependencyInjection
         services.AddScoped<IProfileService, ProfileService>();
         services.AddScoped<IFriendsService, FriendsService>();
         services.AddScoped<IPeopleService, PeopleService>();
+        services.AddScoped<IGamesService, GamesService>();
 
         return services;
     }
