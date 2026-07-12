@@ -1,6 +1,9 @@
 using Microsoft.EntityFrameworkCore;
+using SimPle.Domain.Capabilities;
 using SimPle.Domain.Friends;
 using SimPle.Domain.Games;
+using SimPle.Domain.Lobbies;
+using SimPle.Domain.Matchmaking;
 using SimPle.Domain.Outbox;
 using SimPle.Domain.Profiles;
 using SimPle.Domain.Users;
@@ -38,6 +41,20 @@ public class AppDbContext : DbContext
     public DbSet<GameModeCapability> GameModeCapabilities => Set<GameModeCapability>();
     public DbSet<UserFavoriteGame> UserFavoriteGames => Set<UserFavoriteGame>();
     public DbSet<CatalogSeedHistory> CatalogSeedHistory => Set<CatalogSeedHistory>();
+
+    // Module 6 — lobby & matchmaking system
+    public DbSet<Lobby> Lobbies => Set<Lobby>();
+    public DbSet<LobbyMember> LobbyMembers => Set<LobbyMember>();
+    public DbSet<LobbyInvite> LobbyInvites => Set<LobbyInvite>();
+    public DbSet<LobbyJoinCredential> LobbyJoinCredentials => Set<LobbyJoinCredential>();
+    public DbSet<LobbyStartRequest> LobbyStartRequests => Set<LobbyStartRequest>();
+    public DbSet<MatchmakingTicket> MatchmakingTickets => Set<MatchmakingTicket>();
+    public DbSet<MatchmakingAssignment> MatchmakingAssignments => Set<MatchmakingAssignment>();
+
+    // Module 6 — capability profiles (D2): what a lobby may configure, keyed by (GameSlug, CapabilityVersion).
+    // Additive; Module 4's catalog tables are not mutated.
+    public DbSet<GameCapabilityProfile> GameCapabilityProfiles => Set<GameCapabilityProfile>();
+    public DbSet<CapabilitySeedHistory> CapabilitySeedHistory => Set<CapabilitySeedHistory>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
