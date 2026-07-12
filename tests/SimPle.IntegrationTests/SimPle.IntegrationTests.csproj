@@ -27,6 +27,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\SimPle.Api\SimPle.Api.csproj" />
 
     <!-- Reuses the test-only HiddenTokenDraft reference engine (tests/SimPle.UnitTests/GameHost/Reference) so
