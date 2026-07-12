@@ -21,8 +21,11 @@ using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
 using SimPle.Application.GameHost.Services;
 using SimPle.Domain.GameHost;
+using SimPle.Domain.Games;
+using SimPle.Domain.Lobbies;
 using SimPle.Infrastructure;
 using SimPle.Infrastructure.Auth;
+using SimPle.Infrastructure.Capabilities;
 using SimPle.Infrastructure.Games;
 using SimPle.Infrastructure.Persistence;
 
@@ -88,6 +91,22 @@ builder.Services.AddOptions<JwtSettings>()
         !settings.SecretKey.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase) &&
         !settings.SecretKey.StartsWith("CONFIGURE", StringComparison.OrdinalIgnoreCase),
         "Jwt:SecretKey must be configured outside committed appsettings with at least 32 characters.")
+    .ValidateOnStart();
+
+// Module 6 — the server key that keys every lobby join-code / link-token digest. Validated on start for the same
+// reason as Jwt:SecretKey: a join code carries only ~60 bits, so an unkeyed or well-known digest would make every
+// code in the database offline-guessable. There is deliberately no dev fallback — the module fails closed rather
+// than silently degrading to a weak key.
+builder.Services.AddOptions<LobbyCredentialOptions>()
+    .Bind(builder.Configuration.GetSection(LobbyCredentialOptions.SectionName))
+    .Validate(options =>
+        !string.IsNullOrWhiteSpace(options.Key) &&
+        options.Key.Length >= 32 &&
+        !options.Key.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase) &&
+        !options.Key.StartsWith("CONFIGURE", StringComparison.OrdinalIgnoreCase),
+        "LobbyCredential:Key must be configured outside committed appsettings with at least 32 characters.")
+    .Validate(options => LobbyAllowLists.Regions.Contains(options.DefaultRegion),
+        "LobbyCredential:DefaultRegion must be an allow-listed region (see LobbyAllowLists.Regions).")
     .ValidateOnStart();
 
 builder.Services.AddOptions<RecaptchaOptions>()
@@ -286,6 +305,31 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("catalog-read", context => AuthWindow(context, 120, TimeSpan.FromMinutes(1)));
     options.AddPolicy("game-favorites", context => FriendWindow(context, "gfav", 60, TimeSpan.FromMinutes(1)));
 
+    // Module 6 lobby policies. All per-account (every lobby route is [Authorize]) with the usual coarse per-IP
+    // fallback. Creating a lobby is the expensive one — it mints a credential and takes a seat — so it is the
+    // tightest; reads are generous because the lobby page polls.
+    //
+    // Note that lobby-join throttles *all* join attempts, successful or not. It is NOT the defense against
+    // join-code guessing: a window loose enough to let invited members join freely is far too loose to protect a
+    // ~60-bit code. That job belongs to ILobbyJoinThrottle, which counts failures only (see
+    // MemoryCacheLobbyJoinThrottle) — the two are chained, and both must pass.
+    options.AddPolicy("lobby-create", context => FriendWindow(context, "lbcr", 10, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("lobby-read", context => FriendWindow(context, "lbrd", 120, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("lobby-join", context => FriendWindow(context, "lbjn", 20, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("lobby-write", context => FriendWindow(context, "lbwr", 60, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("lobby-invite", context => FriendWindow(context, "lbiv", 20, TimeSpan.FromMinutes(1)));
+
+    // Module 6 matchmaking policies (slice 6C). Per-account, with the usual coarse per-IP fallback.
+    //
+    // matchmaking-status is by far the loosest of the three, and deliberately so: the queue modal polls a ticket
+    // every 2 seconds for up to its 60-second deadline, which is ~30 requests per ticket before the user has done
+    // anything at all. A limit tight enough to look prudent here would throttle the module's own normal operation.
+    // Enqueue is the tight one — it takes the user's single active slot, so repeating it fast is either a bug or an
+    // attempt to churn the queue (OWASP API4:2023).
+    options.AddPolicy("matchmaking-enqueue", context => FriendWindow(context, "mmen", 10, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("matchmaking-status", context => FriendWindow(context, "mmst", 120, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("matchmaking-write", context => FriendWindow(context, "mmwr", 30, TimeSpan.FromMinutes(1)));
+
     // Chained per-IP ceiling for discovery/people-search (spec: 30/min/account + 120/hour/IP), and for
     // catalog search (spec: 120/min/IP catalog-read + 30/min/IP catalog-search when `query` is present).
     // Scoped by request path/query so it only "bites" on these routes; every other route gets a permanent
@@ -424,6 +468,56 @@ if (args.Contains("--seed-game-catalog"))
     var seedResult = seeder.SeedAsync().GetAwaiter().GetResult();
     Console.WriteLine(seedResult.Message);
     Environment.Exit(seedResult.Success ? 0 : 1);
+}
+
+// Module 6 — capability profiles (D2). Runs after --seed-game-catalog: every profile is FK'd to games.slug and is
+// validated as a subset of its catalog row, so seeding capabilities into an unseeded catalog fails closed with a
+// message naming the missing game rather than writing a profile nothing can resolve.
+if (args.Contains("--seed-game-capabilities"))
+{
+    using var scope = app.Services.CreateScope();
+    var seedDb = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var seedClock = scope.ServiceProvider.GetRequiredService<TimeProvider>();
+    var seedLogger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger<GameCapabilitySeeder>();
+    var seeder = new GameCapabilitySeeder(seedDb, seedClock, seedLogger);
+    var seedResult = seeder.SeedAsync().GetAwaiter().GetResult();
+    Console.WriteLine(seedResult.Message);
+    Environment.Exit(seedResult.Success ? 0 : 1);
+}
+
+// Local/CI-only lifecycle promotion. GameCatalogSeeder always seeds new games as ComingSoon (Module 4);
+// no controller or seeder ever called Game.MakeAvailable(), so no game could reach Available anywhere.
+// Mirrors the --seed-game-* flags above: never exposed as an HTTP endpoint, CLI-only.
+if (args.Contains("--publish-game"))
+{
+    var slugIndex = Array.IndexOf(args, "--publish-game") + 1;
+    var slug = slugIndex > 0 && slugIndex < args.Length ? args[slugIndex] : null;
+    if (string.IsNullOrWhiteSpace(slug))
+    {
+        Console.WriteLine("--publish-game requires a slug argument.");
+        Environment.Exit(1);
+    }
+
+    using var scope = app.Services.CreateScope();
+    var seedDb = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var game = seedDb.Games.FirstOrDefault(g => g.Slug == slug);
+    if (game is null)
+    {
+        Console.WriteLine($"No game with slug '{slug}' found.");
+        Environment.Exit(1);
+    }
+
+    if (game!.Lifecycle != GameLifecycle.Available)
+    {
+        game.MakeAvailable();
+        seedDb.SaveChanges();
+        Console.WriteLine($"Promoted '{slug}' to Available.");
+    }
+    else
+    {
+        Console.WriteLine($"'{slug}' is already Available; no-op.");
+    }
+    Environment.Exit(0);
 }
 
 app.Run();

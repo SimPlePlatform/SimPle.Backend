@@ -1,0 +1,110 @@
+{
+  "$comment": "Module 6 capability profiles (D2). Every profile is a STRICT SUBSET of the Module 4 catalog row for the same slug: player bounds sit inside the catalog's, and allowedModes is a subset of the catalog's modes. GameCapabilityProfile.ContradictsCatalog() enforces exactly that, and the seeder refuses to write a manifest that violates it. Profiles pin at minPlayers >= 2 because a lobby is a multiplayer surface: a game's solo mode is reachable from the library, not from a lobby.",
+  "manifestVersion": "2026.1",
+  "profiles": [
+    {
+      "gameSlug": "online-sudoku",
+      "capabilityVersion": 1,
+      "minPlayers": 2,
+      "maxPlayers": 2,
+      "allowedModes": ["cooperative"],
+      "timeControls": ["untimed", "rapid-10-0", "classical-30-0"],
+      "tieBreakRules": ["none", "fastest-finish"],
+      "spectatorPolicies": ["Anyone", "FriendsOnly", "Disabled"],
+      "ratedEligible": false,
+      "aiFillEligible": false,
+      "isActive": true
+    },
+    {
+      "gameSlug": "falling-blocks-arena",
+      "capabilityVersion": 1,
+      "minPlayers": 2,
+      "maxPlayers": 4,
+      "allowedModes": ["multiplayer", "quick-match"],
+      "timeControls": ["blitz-3-2", "blitz-5-0"],
+      "tieBreakRules": ["none", "highest-score"],
+      "spectatorPolicies": ["Anyone", "FriendsOnly", "Disabled"],
+      "ratedEligible": false,
+      "aiFillEligible": false,
+      "isActive": true
+    },
+    {
+      "gameSlug": "four-in-a-row",
+      "capabilityVersion": 1,
+      "minPlayers": 2,
+      "maxPlayers": 2,
+      "allowedModes": ["multiplayer", "ranked", "ai"],
+      "timeControls": ["untimed", "blitz-3-2", "blitz-5-0", "rapid-10-0"],
+      "tieBreakRules": ["none", "sudden-death"],
+      "spectatorPolicies": ["Anyone", "FriendsOnly", "Disabled"],
+      "ratedEligible": true,
+      "aiFillEligible": true,
+      "isActive": true
+    },
+    {
+      "gameSlug": "chess-lite",
+      "capabilityVersion": 1,
+      "minPlayers": 2,
+      "maxPlayers": 2,
+      "allowedModes": ["multiplayer", "ranked", "ai"],
+      "timeControls": ["bullet-1-0", "blitz-3-2", "blitz-5-0", "rapid-10-0", "classical-30-0"],
+      "tieBreakRules": ["none", "sudden-death", "fewest-moves"],
+      "spectatorPolicies": ["Anyone", "FriendsOnly", "Disabled"],
+      "ratedEligible": true,
+      "aiFillEligible": true,
+      "isActive": true
+    },
+    {
+      "gameSlug": "checkers",
+      "capabilityVersion": 1,
+      "minPlayers": 2,
+      "maxPlayers": 2,
+      "allowedModes": ["multiplayer", "ranked", "ai"],
+      "timeControls": ["blitz-3-2", "blitz-5-0", "rapid-10-0", "classical-30-0"],
+      "tieBreakRules": ["none", "sudden-death"],
+      "spectatorPolicies": ["Anyone", "FriendsOnly", "Disabled"],
+      "ratedEligible": true,
+      "aiFillEligible": true,
+      "isActive": true
+    },
+    {
+      "gameSlug": "five-letter-duel",
+      "capabilityVersion": 1,
+      "minPlayers": 2,
+      "maxPlayers": 2,
+      "allowedModes": ["multiplayer"],
+      "timeControls": ["untimed", "blitz-3-2", "rapid-10-0"],
+      "tieBreakRules": ["none", "fewest-moves", "fastest-finish"],
+      "spectatorPolicies": ["Anyone", "FriendsOnly", "Disabled"],
+      "ratedEligible": false,
+      "aiFillEligible": false,
+      "isActive": true
+    },
+    {
+      "gameSlug": "memory-grid",
+      "capabilityVersion": 1,
+      "minPlayers": 2,
+      "maxPlayers": 4,
+      "allowedModes": ["cooperative", "multiplayer"],
+      "timeControls": ["untimed", "blitz-3-2", "rapid-10-0"],
+      "tieBreakRules": ["none", "fastest-finish", "highest-score"],
+      "spectatorPolicies": ["Anyone", "FriendsOnly", "Disabled"],
+      "ratedEligible": false,
+      "aiFillEligible": false,
+      "isActive": true
+    },
+    {
+      "gameSlug": "snake-rush",
+      "capabilityVersion": 1,
+      "minPlayers": 2,
+      "maxPlayers": 8,
+      "allowedModes": ["multiplayer", "quick-match"],
+      "timeControls": ["blitz-3-2", "blitz-5-0"],
+      "tieBreakRules": ["none", "highest-score"],
+      "spectatorPolicies": ["Anyone", "FriendsOnly", "Disabled"],
+      "ratedEligible": false,
+      "aiFillEligible": false,
+      "isActive": true
+    }
+  ]
+}
