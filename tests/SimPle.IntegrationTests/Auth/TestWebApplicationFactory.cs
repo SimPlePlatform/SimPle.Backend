@@ -40,6 +40,10 @@ public sealed class TestWebApplicationFactory : WebApplicationFactory<Program>
                 ["Auth:RefreshTokenExpiryDays"] = "7",
                 ["Auth:MaxFailedLoginAttempts"] = "10",
                 ["Auth:LockoutDurationMinutes"] = "15",
+                // Module 6: the API fails closed at startup when the join-credential key is unset, exactly as it
+                // does for Jwt:SecretKey. Tests supply their own rather than the module shipping a dev fallback.
+                ["LobbyCredential:Key"] = "integration-tests-lobby-credential-key-123456",
+                ["LobbyCredential:DefaultRegion"] = "eu-west",
                 ["Recaptcha:SecretKey"] = "integration-tests-recaptcha-secret",
                 ["Recaptcha:VerificationUrl"] = "https://captcha.invalid/siteverify",
                 ["Email:From"] = "test@example.com",

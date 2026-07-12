@@ -14,7 +14,6 @@
             [SimPle.Domain]SimPle.Domain.Chat.*,
             [SimPle.Domain]SimPle.Domain.Games.*,
             [SimPle.Domain]SimPle.Domain.Hardware.*,
-            [SimPle.Domain]SimPle.Domain.Lobbies.*,
             [SimPle.Domain]SimPle.Domain.Notifications.*
           </Exclude>
           <ExcludeByAttribute>GeneratedCodeAttribute,CompilerGeneratedAttribute,ExcludeFromCodeCoverageAttribute</ExcludeByAttribute>

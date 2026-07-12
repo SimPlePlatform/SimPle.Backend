@@ -51,7 +51,12 @@ public sealed class FriendsMigrationSmokeTests : IAsyncLifetime
             SELECT pg_terminate_backend(pg_stat_activity.pid)
             FROM pg_stat_activity
             WHERE pg_stat_activity.datname = '{_dbName}'
-              AND pid <> pg_backend_pid();";
+              AND pid <> pg_backend_pid()
+              -- Only this role's own backends. Terminating another role's process raises 42501, and an
+              -- autovacuum worker (which runs as the bootstrap superuser) can appear on this database at
+              -- any moment -- so the unfiltered form fails intermittently under a least-privilege test role.
+              -- The teardown below clears autovacuum on its own, so skipping those backends is safe.
+              AND usename = current_user;";
         await terminateCmd.ExecuteNonQueryAsync();
 
         await using var dropCmd = masterConn.CreateCommand();

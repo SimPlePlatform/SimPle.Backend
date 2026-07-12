@@ -1,3 +1,4 @@
+using System.Linq;
 using FluentAssertions;
 using NSubstitute;
 using SimPle.Application.Common.Interfaces;
@@ -209,7 +210,9 @@ public sealed class GamesServiceTests
 
         result.IsSuccess.Should().BeTrue();
         result.Value!.Game!.EntryActions.Should().BeEquivalentTo(GameEntryActions.All);
-        result.Value.Game.EntryActions.Should().OnlyContain(a => a.Status == "deferred");
+        // M9/M8 haven't shipped yet; M6's 3 owned actions flipped to enabled once its own gate passed.
+        result.Value.Game.EntryActions.Where(a => a.OwnerModule != 6).Should().OnlyContain(a => a.Status == "deferred");
+        result.Value.Game.EntryActions.Where(a => a.OwnerModule == 6).Should().OnlyContain(a => a.Status == "enabled");
     }
 
     // ── Detail: 404 / 410 / 200 per lifecycle ────────────────────────────────
