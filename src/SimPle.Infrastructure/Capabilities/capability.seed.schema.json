@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simple.gg/schemas/capability.seed.v1.json",
+  "title": "Module 6 game capability seed manifest",
+  "description": "Declares what a lobby or ticket may configure for each game, at a pinned (gameSlug, capabilityVersion). Additive to Module 4's catalog: it never mutates or re-seeds games. Structural validation only — the seeder additionally enforces every domain invariant (allow-list membership, subset-of-catalog, rated/AI mode implications) before any database write.",
+  "type": "object",
+  "required": ["manifestVersion", "profiles"],
+  "additionalProperties": true,
+  "properties": {
+    "$comment": { "type": "string" },
+    "manifestVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "description": "Checksummed and recorded in capability_seed_history. Re-applying the same version with different content fails closed."
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/profile" }
+    }
+  },
+  "$defs": {
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gameSlug",
+        "capabilityVersion",
+        "minPlayers",
+        "maxPlayers",
+        "allowedModes",
+        "timeControls",
+        "tieBreakRules",
+        "spectatorPolicies",
+        "ratedEligible",
+        "aiFillEligible",
+        "isActive"
+      ],
+      "properties": {
+        "gameSlug": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Foreign key to games.slug. The game must already exist in Module 4's catalog."
+        },
+        "capabilityVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The pin. Publishing different capabilities means publishing a NEW version row — never editing an existing one, because a lobby that pinned v1 must keep meaning what it meant at creation."
+        },
+        "minPlayers": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 8,
+          "description": "At least 2: a lobby is a multiplayer surface. A game's solo mode is reachable from the library, not from a lobby."
+        },
+        "maxPlayers": { "type": "integer", "minimum": 2, "maximum": 8 },
+        "allowedModes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["solo", "cooperative", "multiplayer", "ai", "ranked", "quick-match"]
+          },
+          "description": "Must be a subset of the Module 4 catalog row's modes for the same slug."
+        },
+        "timeControls": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["untimed", "bullet-1-0", "blitz-3-2", "blitz-5-0", "rapid-10-0", "classical-30-0"]
+          }
+        },
+        "tieBreakRules": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["none", "sudden-death", "fastest-finish", "highest-score", "fewest-moves"]
+          }
+        },
+        "spectatorPolicies": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["Anyone", "FriendsOnly", "Disabled"] }
+        },
+        "ratedEligible": {
+          "type": "boolean",
+          "description": "Requires 'ranked' in allowedModes. Rating itself is provisional until Module 10."
+        },
+        "aiFillEligible": {
+          "type": "boolean",
+          "description": "Requires 'ai' in allowedModes. Storing the request is all Module 6 does — no AI participant can be created before Module 9."
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "At most one active profile per game. Deactivating one is what makes 'capability disabled after create' a real, testable path for lobbies already pinned to it."
+        }
+      }
+    }
+  }
+}

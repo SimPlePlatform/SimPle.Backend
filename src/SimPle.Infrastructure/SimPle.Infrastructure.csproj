@@ -9,6 +9,8 @@
   <ItemGroup>
     <EmbeddedResource Include="Games\catalog.seed.v1.json" />
     <EmbeddedResource Include="Games\catalog.seed.schema.json" />
+    <EmbeddedResource Include="Capabilities\capability.seed.v1.json" />
+    <EmbeddedResource Include="Capabilities\capability.seed.schema.json" />
   </ItemGroup>
 
   <ItemGroup>

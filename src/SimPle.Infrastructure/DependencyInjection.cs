@@ -4,8 +4,12 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
+using SimPle.Application.Lobbies.Services;
 using SimPle.Infrastructure.Auth;
 using SimPle.Infrastructure.Email;
+using SimPle.Infrastructure.Lobbies;
+using SimPle.Infrastructure.Matchmaking;
+using SimPle.Infrastructure.Outbox;
 using SimPle.Infrastructure.Persistence;
 using SimPle.Infrastructure.Persistence.Repositories;
 using SimPle.Infrastructure.Storage;
@@ -42,6 +46,28 @@ public static class DependencyInjection
         services.AddScoped<IRetiredUsernameRepository, RetiredUsernameRepository>();
         services.AddScoped<IFriendRepository, FriendRepository>();
         services.AddScoped<IGameRepository, GameRepository>();
+
+        // Module 6 — injected clock (R4). Scoped to M6-owned code only: the 66 pre-existing raw DateTime.UtcNow
+        // call sites across the codebase are deliberately NOT refactored, because a half-done cross-cutting clock
+        // change would be worse than none. M6's own code takes TimeProvider so the mandatory fake-clock tests of
+        // the 15/30/60-second bands and the 2h/30min expiries (brief Risk #8) are actually provable.
+        services.AddSingleton(TimeProvider.System);
+
+        services.AddScoped<ILobbyCredentialHasher, HmacLobbyCredentialHasher>();
+        services.AddScoped<ILobbyRepository, LobbyRepository>();
+
+        // R3 — reruns a whole lobby command (read + decide + write) on contention and surfaces a typed conflict.
+        // Scoped, because it clears the change tracker of the same scoped AppDbContext the command reads through.
+        services.AddScoped<ILobbyCommandRunner, LobbyCommandRunner>();
+
+        // Honest dependency probes. Every one reports "not available" because M7/M8/M9 do not exist — which is
+        // what makes Start a 503, `allowedActions` omit `start`, and the UI's disabled controls truthful rather
+        // than decorative. Each is replaced, not rewritten, when its module lands.
+        services.AddSingleton<IMatchRuntimeProbe, NoMatchRuntimeProbe>();
+        services.AddSingleton<IChatRuntimeProbe, NoChatRuntimeProbe>();
+        services.AddSingleton<IAiParticipantProbe, NoAiParticipantProbe>();
+
+        services.AddSingleton<ILobbyJoinThrottle, MemoryCacheLobbyJoinThrottle>();
         services.Configure<StorageOptions>(configuration.GetSection(StorageOptions.SectionName));
         services.PostConfigure<StorageOptions>(options =>
         {
@@ -57,6 +83,25 @@ public static class DependencyInjection
         services.Configure<DismissedSuggestionCleanupOptions>(
             configuration.GetSection(DismissedSuggestionCleanupOptions.SectionName));
         services.AddHostedService<DismissedSuggestionCleanupService>();
+
+        // ── Module 6, slice 6C — matchmaking, expiry, and the outbox dispatcher ──
+
+        services.AddScoped<IMatchmakingRepository, MatchmakingRepository>();
+        services.AddScoped<IOutboxRepository, OutboxRepository>();
+
+        // ILobbyCommandRunner's sibling for background work: same transaction and contention semantics, no advisory
+        // lock (a worker has no actor to serialize).
+        services.AddScoped<IWorkerTransaction, WorkerTransaction>();
+
+        services.Configure<MatchmakingOptions>(configuration.GetSection(MatchmakingOptions.SectionName));
+        services.Configure<ExpiryOptions>(configuration.GetSection(ExpiryOptions.SectionName));
+        services.Configure<OutboxOptions>(configuration.GetSection(OutboxOptions.SectionName));
+
+        // All three honour a WorkerEnabled flag and simply do not start when it is false — that is how the rollback
+        // plan disables the workers while preserving every lobby and ticket record.
+        services.AddHostedService<MatchmakingWorker>();
+        services.AddHostedService<LobbyExpiryWorker>();
+        services.AddHostedService<OutboxDispatcherWorker>();
 
         return services;
     }
