@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -63,7 +64,7 @@ public sealed class GameCatalogSeeder
         if (validationError is not null)
             return Fail(validationError);
 
-        var checksum = Convert.ToHexString(SHA256.HashData(manifestBytes)).ToLowerInvariant();
+        var checksum = ComputeManifestChecksum(manifestBytes);
 
         await using var transaction = await _db.Database.BeginTransactionAsync(ct);
         await _db.Database.ExecuteSqlRawAsync(
@@ -176,6 +177,19 @@ public sealed class GameCatalogSeeder
     {
         _logger.LogError("Game catalog seed failed: {Message}", message);
         return new GameCatalogSeedResult(false, message, 0, 0);
+    }
+
+    /// <summary>
+    /// Hashes the manifest with canonical LF line endings. Git's core.autocrlf must never make a
+    /// semantically identical checked-in manifest appear to be a different seed revision on Windows.
+    /// Formatting/content changes still change the checksum and therefore remain fail-closed.
+    /// </summary>
+    public static string ComputeManifestChecksum(ReadOnlySpan<byte> manifestBytes)
+    {
+        var normalized = Encoding.UTF8.GetString(manifestBytes)
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace("\r", "\n", StringComparison.Ordinal);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))).ToLowerInvariant();
     }
 
     /// <summary>
