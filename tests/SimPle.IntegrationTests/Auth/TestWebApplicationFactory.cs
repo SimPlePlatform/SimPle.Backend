@@ -54,6 +54,13 @@ public sealed class TestWebApplicationFactory : WebApplicationFactory<Program>
                 ["Email:Password"] = "test-password",
                 ["Email:AppUrl"] = "http://localhost:3000",
                 ["Google:ClientId"] = "integration-tests-google-client-id",
+                ["Storage:Provider"] = "S3Compatible",
+                ["Storage:BucketName"] = "integration-tests-profile-assets",
+                ["Storage:Region"] = "us-east-1",
+                ["Storage:ServiceUrl"] = "http://storage.invalid",
+                ["Storage:AccessKey"] = "integration-tests-storage-access-key",
+                ["Storage:SecretKey"] = "integration-tests-storage-secret-key",
+                ["Storage:ProfilePrefix"] = "profile-assets",
                 ["ConnectionStrings:DefaultConnection"] = "unused-for-in-memory-tests"
             });
         });

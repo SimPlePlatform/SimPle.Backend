@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
+using SimPle.Infrastructure.Health;
 
 namespace SimPle.Infrastructure.Persistence;
 
@@ -16,19 +17,24 @@ public sealed class DismissedSuggestionCleanupService : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<DismissedSuggestionCleanupService> _logger;
     private readonly DismissedSuggestionCleanupOptions _options;
+    private readonly IWorkerReadinessRegistry _readiness;
 
     public DismissedSuggestionCleanupService(
         IServiceScopeFactory scopeFactory,
         ILogger<DismissedSuggestionCleanupService> logger,
-        IOptions<DismissedSuggestionCleanupOptions> options)
+        IOptions<DismissedSuggestionCleanupOptions> options,
+        IWorkerReadinessRegistry readiness)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
         _options = options.Value;
+        _readiness = readiness;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _readiness.MarkStarted(RequiredWorkers.DismissedSuggestionCleanup);
+
         // Stagger the first run so it doesn't run immediately on startup.
         await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
 
@@ -62,9 +68,12 @@ public sealed class DismissedSuggestionCleanupService : BackgroundService
                 _logger.LogInformation(
                     "Dismissed-suggestion cleanup: deleted {Count} expired rows (cutoff: {Cutoff:u})",
                     total, now);
+
+            _readiness.MarkHealthy(RequiredWorkers.DismissedSuggestionCleanup);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            _readiness.MarkUnhealthy(RequiredWorkers.DismissedSuggestionCleanup);
             _logger.LogError(ex, "Dismissed-suggestion cleanup failed. Will retry in {Interval}.", _options.Interval);
         }
     }

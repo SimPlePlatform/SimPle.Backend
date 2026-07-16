@@ -6,13 +6,16 @@ using DotNetEnv.Configuration;
 using FluentValidation;
 using FluentValidation.AspNetCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
 using Microsoft.IdentityModel.Tokens;
 using SimPle.Api.Middleware;
+using SimPle.Api.Health;
 using SimPle.Api.Models;
 using SimPle.Api.OpenApi;
 using SimPle.Application;
@@ -30,6 +33,17 @@ using SimPle.Infrastructure.Games;
 using SimPle.Infrastructure.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Container platforms consume structured stdout. Development keeps the familiar readable console provider while
+// production JSON includes logging scopes such as CorrelationId for request-to-log and request-to-response tracing.
+if (!builder.Environment.IsDevelopment())
+{
+    builder.Logging.ClearProviders();
+    builder.Logging.AddJsonConsole(options => options.IncludeScopes = true);
+    // EF parameter values are redacted by default, but command text is still high-volume operational noise and can
+    // reveal data shape. Keep production logs structured and useful without turning them into a query transcript.
+    builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Command", LogLevel.Warning);
+}
 
 if (builder.Environment.IsDevelopment())
 {
@@ -76,6 +90,10 @@ builder.Services.AddFluentValidationAutoValidation();
 builder.Services.AddValidatorsFromAssemblyContaining<RegisterRequestValidator>();
 builder.Services.AddApplicationServices();
 builder.Services.AddInfrastructureServices(builder.Configuration);
+builder.Services.AddHealthChecks()
+    .AddCheck<DatabaseReadinessHealthCheck>("database", tags: ["ready"])
+    .AddCheck<StorageConfigurationHealthCheck>("storage-configuration", tags: ["ready"])
+    .AddCheck<WorkerReadinessHealthCheck>("background-workers", tags: ["ready"]);
 
 // The composition root's list of installed Phase 2 game engines. Empty today — Module 5 hosts no product
 // game yet, only the test-only HiddenTokenDraft reference engine, which is never registered here. A duplicate
@@ -255,7 +273,6 @@ builder.Services.AddRateLimiter(options =>
         }
 
         // Security event (brief: rate-limit rejections are logged with actor, target, action, result).
-        // No correlation-id infrastructure exists in this codebase yet (pre-existing gap, tracked separately).
         var rateLimitLogger = context.HttpContext.RequestServices
             .GetRequiredService<ILoggerFactory>().CreateLogger("RateLimiting");
         var policyName = context.HttpContext.GetEndpoint()?.Metadata
@@ -405,6 +422,7 @@ using (var startupScope = app.Services.CreateScope())
 
 // Must be first — sets RemoteIpAddress from X-Forwarded-For before any other middleware reads it.
 app.UseForwardedHeaders();
+app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 app.UseMiddleware<SecurityHeadersMiddleware>();
 
@@ -427,7 +445,30 @@ app.UseRateLimiter();      // can now read authenticated subject claim for per-u
 app.UseAuthorization();
 
 app.MapControllers();
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    // A liveness probe answers only whether this process can serve HTTP. It must never restart the container because
+    // PostgreSQL, storage, or a background worker is temporarily unavailable.
+    Predicate = _ => false,
+    ResponseWriter = WriteHealthResponse,
+});
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = registration => registration.Tags.Contains("ready"),
+    ResponseWriter = WriteHealthResponse,
+});
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", utc = DateTime.UtcNow }));
+
+static Task WriteHealthResponse(HttpContext context, HealthReport report)
+{
+    // Dependency names, connection errors, pending migration IDs, and worker state stay out of this public endpoint.
+    // The HTTP status and this single status field are sufficient for Container Apps / Caddy probes.
+    context.Response.ContentType = "application/json";
+    return context.Response.WriteAsJsonAsync(new
+    {
+        status = report.Status == HealthStatus.Healthy ? "healthy" : "unhealthy",
+    });
+}
 
 static RateLimitPartition<string> AuthWindow(HttpContext context, int permitLimit, TimeSpan window) =>
     RateLimitPartition.GetFixedWindowLimiter(
@@ -457,6 +498,39 @@ static RateLimitPartition<string> FriendWindow(HttpContext context, string prefi
             QueueLimit = 0,
             QueueProcessingOrder = QueueProcessingOrder.OldestFirst
         });
+}
+
+// Explicit, one-shot release jobs. They reuse the application composition root so migrations and seeders use the
+// same configuration and provider as the running API, but they never start the HTTP server or background workers.
+// A deployment must invoke them one at a time and record their exit code as release evidence.
+if (args.Contains("--apply-migrations"))
+{
+    using var scope = app.Services.CreateScope();
+    var migrationDb = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    migrationDb.Database.Migrate();
+    Console.WriteLine("Database migrations applied successfully.");
+    Environment.Exit(0);
+}
+
+if (args.Contains("--seed"))
+{
+    using var scope = app.Services.CreateScope();
+    var seedDb = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var seedLogger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger<GameCatalogSeeder>();
+    var gameSeeder = new GameCatalogSeeder(seedDb, seedLogger);
+    var gameResult = gameSeeder.SeedAsync().GetAwaiter().GetResult();
+    if (!gameResult.Success)
+    {
+        Console.Error.WriteLine(gameResult.Message);
+        Environment.Exit(1);
+    }
+
+    var capabilityClock = scope.ServiceProvider.GetRequiredService<TimeProvider>();
+    var capabilityLogger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger<GameCapabilitySeeder>();
+    var capabilitySeeder = new GameCapabilitySeeder(seedDb, capabilityClock, capabilityLogger);
+    var capabilityResult = capabilitySeeder.SeedAsync().GetAwaiter().GetResult();
+    Console.WriteLine(capabilityResult.Message);
+    Environment.Exit(capabilityResult.Success ? 0 : 1);
 }
 
 if (args.Contains("--seed-game-catalog"))

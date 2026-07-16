@@ -7,6 +7,7 @@ using SimPle.Application.Common.Options;
 using SimPle.Application.Lobbies.Services;
 using SimPle.Infrastructure.Auth;
 using SimPle.Infrastructure.Email;
+using SimPle.Infrastructure.Health;
 using SimPle.Infrastructure.Lobbies;
 using SimPle.Infrastructure.Matchmaking;
 using SimPle.Infrastructure.Outbox;
@@ -75,6 +76,10 @@ public static class DependencyInjection
         });
         services.AddScoped<IFileStorageService, S3FileStorageService>();
         services.AddHttpClient<ICaptchaVerificationService, GoogleRecaptchaV2Service>();
+
+        // Readiness is intentionally process-local: this application is deployed as a single backend instance, so
+        // these durable workers and the API must share one lifecycle until a later distributed design is approved.
+        services.AddSingleton<IWorkerReadinessRegistry>(_ => new WorkerReadinessRegistry(RequiredWorkers.All));
 
         services.Configure<TokenCleanupOptions>(
             configuration.GetSection(TokenCleanupOptions.SectionName));

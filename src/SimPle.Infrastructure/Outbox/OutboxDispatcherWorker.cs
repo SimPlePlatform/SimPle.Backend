@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SimPle.Application.Common.Options;
 using SimPle.Application.Outbox;
+using SimPle.Infrastructure.Health;
 
 namespace SimPle.Infrastructure.Outbox;
 
@@ -28,15 +29,18 @@ public sealed class OutboxDispatcherWorker : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly OutboxOptions _options;
     private readonly ILogger<OutboxDispatcherWorker> _logger;
+    private readonly IWorkerReadinessRegistry _readiness;
 
     public OutboxDispatcherWorker(
         IServiceScopeFactory scopeFactory,
         IOptions<OutboxOptions> options,
-        ILogger<OutboxDispatcherWorker> logger)
+        ILogger<OutboxDispatcherWorker> logger,
+        IWorkerReadinessRegistry readiness)
     {
         _scopeFactory = scopeFactory;
         _options = options.Value;
         _logger = logger;
+        _readiness = readiness;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -44,8 +48,11 @@ public sealed class OutboxDispatcherWorker : BackgroundService
         if (!_options.WorkerEnabled)
         {
             _logger.LogInformation("Outbox dispatcher is disabled by configuration; not starting.");
+            _readiness.MarkUnhealthy(RequiredWorkers.OutboxDispatcher);
             return;
         }
+
+        _readiness.MarkStarted(RequiredWorkers.OutboxDispatcher);
 
         _logger.LogInformation(
             "Outbox dispatcher started. Interval={Interval} BatchSize={BatchSize} MaxAttempts={MaxAttempts}",
@@ -68,43 +75,57 @@ public sealed class OutboxDispatcherWorker : BackgroundService
 
     private async Task DispatchAllAsync(CancellationToken ct)
     {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-
-        var handlers = scope.ServiceProvider.GetServices<IOutboxHandler>().ToList();
-        if (handlers.Count == 0) return;
-
-        foreach (var handler in handlers)
+        try
         {
-            if (ct.IsCancellationRequested) break;
+            await using var scope = _scopeFactory.CreateAsyncScope();
 
-            try
+            var handlers = scope.ServiceProvider.GetServices<IOutboxHandler>().ToList();
+            var allHandlersSucceeded = true;
+
+            foreach (var handler in handlers)
             {
-                // A fresh scope per handler: the processor and the handler share a scoped AppDbContext, and one
-                // handler's failed save must not leave a dirty change tracker for the next one to trip over.
-                await using var handlerScope = _scopeFactory.CreateAsyncScope();
-                var processor = handlerScope.ServiceProvider.GetRequiredService<IOutboxProcessor>();
-                var scopedHandler = handlerScope.ServiceProvider
-                    .GetServices<IOutboxHandler>()
-                    .First(h => h.HandlerName == handler.HandlerName);
+                if (ct.IsCancellationRequested) break;
 
-                var result = await processor.DispatchAsync(scopedHandler, ct);
-
-                if (result.Processed > 0 || result.Failed > 0)
+                try
                 {
-                    _logger.LogInformation(
-                        "Outbox pass. Handler={Handler} Leased={Leased} Processed={Processed} Failed={Failed} DeadLettered={DeadLettered} OldestPendingMs={OldestMs}",
-                        handler.HandlerName, result.Leased, result.Processed, result.Failed, result.DeadLettered,
-                        (long?)result.OldestPendingAge?.TotalMilliseconds);
+                    // A fresh scope per handler: the processor and the handler share a scoped AppDbContext, and one
+                    // handler's failed save must not leave a dirty change tracker for the next one to trip over.
+                    await using var handlerScope = _scopeFactory.CreateAsyncScope();
+                    var processor = handlerScope.ServiceProvider.GetRequiredService<IOutboxProcessor>();
+                    var scopedHandler = handlerScope.ServiceProvider
+                        .GetServices<IOutboxHandler>()
+                        .First(h => h.HandlerName == handler.HandlerName);
+
+                    var result = await processor.DispatchAsync(scopedHandler, ct);
+
+                    if (result.Processed > 0 || result.Failed > 0)
+                    {
+                        _logger.LogInformation(
+                            "Outbox pass. Handler={Handler} Leased={Leased} Processed={Processed} Failed={Failed} DeadLettered={DeadLettered} OldestPendingMs={OldestMs}",
+                            handler.HandlerName, result.Leased, result.Processed, result.Failed, result.DeadLettered,
+                            (long?)result.OldestPendingAge?.TotalMilliseconds);
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    allHandlersSucceeded = false;
+                    // Nothing is lost: any delivery this pass leased keeps its lease only until it lapses, after which
+                    // another pass reclaims it. That is precisely why the lease is a timestamp and not a boolean.
+                    _logger.LogError(
+                        ex, "Outbox dispatch pass failed. Handler={Handler}. Leases will lapse and be retried.",
+                        handler.HandlerName);
                 }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // Nothing is lost: any delivery this pass leased keeps its lease only until it lapses, after which
-                // another pass reclaims it. That is precisely why the lease is a timestamp and not a boolean.
-                _logger.LogError(
-                    ex, "Outbox dispatch pass failed. Handler={Handler}. Leases will lapse and be retried.",
-                    handler.HandlerName);
-            }
+
+            if (allHandlersSucceeded)
+                _readiness.MarkHealthy(RequiredWorkers.OutboxDispatcher);
+            else
+                _readiness.MarkUnhealthy(RequiredWorkers.OutboxDispatcher);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _readiness.MarkUnhealthy(RequiredWorkers.OutboxDispatcher);
+            _logger.LogError(ex, "Outbox dispatcher health check failed. Will retry in {Interval}.", _options.Interval);
         }
     }
 }
