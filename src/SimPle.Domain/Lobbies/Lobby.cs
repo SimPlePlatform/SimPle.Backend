@@ -170,7 +170,7 @@ public class Lobby : Entity
         var successor = JoinedMembers.FirstOrDefault();
         if (successor is null)
         {
-            CloseInternal(LobbyClosedReason.NoEligibleHost);
+            CloseInternal(LobbyClosedReason.NoEligibleHost, nowUtc);
             Mutated();
             return new LobbyLeaveResult(LobbyOutcome.Ok, null, LobbyClosedReason.NoEligibleHost);
         }
@@ -279,7 +279,7 @@ public class Lobby : Entity
         // A lobby that expired while M8 was working does not silently reopen.
         if (IsExpired(nowUtc))
         {
-            CloseInternal(LobbyClosedReason.Expired);
+            CloseInternal(LobbyClosedReason.Expired, nowUtc);
             State = LobbyState.Expired;
             Mutated();
             return LobbyOutcome.Expired;
@@ -293,11 +293,11 @@ public class Lobby : Entity
         return LobbyOutcome.Ok;
     }
 
-    public LobbyOutcome Close(LobbyClosedReason reason)
+    public LobbyOutcome Close(LobbyClosedReason reason, DateTime nowUtc)
     {
         if (IsTerminal) return LobbyOutcome.Closed;
 
-        CloseInternal(reason);
+        CloseInternal(reason, nowUtc);
         Mutated();
         return LobbyOutcome.Ok;
     }
@@ -312,6 +312,7 @@ public class Lobby : Entity
 
         State = LobbyState.Expired;
         ClosedReason = LobbyClosedReason.Expired;
+        ReleaseAllJoinedMembers(nowUtc);
         Mutated();
         return true;
     }
@@ -347,10 +348,24 @@ public class Lobby : Entity
             member.SetReadiness(false);
     }
 
-    private void CloseInternal(LobbyClosedReason reason)
+    private void CloseInternal(LobbyClosedReason reason, DateTime nowUtc)
     {
         State = LobbyState.Closed;
         ClosedReason = reason;
+        ReleaseAllJoinedMembers(nowUtc);
+    }
+
+    /// <summary>
+    /// Releases every still-joined seat when the lobby itself goes terminal. Without this, a member who was never
+    /// individually removed (e.g. the sole host of a lobby that expires) stays at <c>LobbyMemberState.Joined</c>
+    /// forever — invisible to <c>GetActiveLobbyForUserAsync</c> (which filters on the lobby's own terminal state)
+    /// but not to the DB's partial unique index on (UserId, Joined), permanently blocking that user from ever
+    /// joining or creating another lobby.
+    /// </summary>
+    private void ReleaseAllJoinedMembers(DateTime nowUtc)
+    {
+        foreach (var member in _members.Where(m => m.IsJoined))
+            member.Leave(nowUtc);
     }
 
     private void Mutated()

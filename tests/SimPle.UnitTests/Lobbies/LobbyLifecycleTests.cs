@@ -75,6 +75,40 @@ public class LobbyLifecycleTests
         lobby.State.Should().Be(LobbyState.Open);
     }
 
+    /// <summary>
+    /// Regression: expiry used to only flip Lobby.State, leaving every still-seated member's own
+    /// LobbyMemberState stuck at Joined. That row survives forever against the DB's partial unique index on
+    /// (UserId, Joined) — even though the lobby itself is terminal and invisible to GetActiveLobbyForUserAsync —
+    /// permanently blocking that user from ever joining or creating another lobby.
+    /// </summary>
+    [Fact]
+    public void ExpiryReleasesEveryRemainingSeatedMember()
+    {
+        var lobby = LobbyTestFactory.Open(_host, Now);
+        lobby.Join(_alice, Now).Should().Be(LobbyOutcome.Ok);
+        _clock.Advance(TimeSpan.FromHours(2));
+
+        lobby.TryExpire(Now).Should().BeTrue();
+
+        lobby.JoinedCount.Should().Be(0);
+        lobby.FindJoinedMember(_host).Should().BeNull();
+        lobby.FindJoinedMember(_alice).Should().BeNull();
+    }
+
+    /// <summary>Same guarantee for an explicit Close, not just expiry.</summary>
+    [Fact]
+    public void ClosingALobbyReleasesEveryRemainingSeatedMember()
+    {
+        var lobby = LobbyTestFactory.Open(_host, Now);
+        lobby.Join(_alice, Now).Should().Be(LobbyOutcome.Ok);
+
+        lobby.Close(LobbyClosedReason.HostClosed, Now).Should().Be(LobbyOutcome.Ok);
+
+        lobby.JoinedCount.Should().Be(0);
+        lobby.FindJoinedMember(_host).Should().BeNull();
+        lobby.FindJoinedMember(_alice).Should().BeNull();
+    }
+
     // ── Capacity ─────────────────────────────────────────────────────────────
 
     [Fact]
