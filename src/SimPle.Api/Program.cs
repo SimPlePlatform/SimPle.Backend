@@ -14,15 +14,18 @@ using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
 using Microsoft.IdentityModel.Tokens;
+using SimPle.Api.Hubs;
 using SimPle.Api.Middleware;
 using SimPle.Api.Health;
 using SimPle.Api.Models;
 using SimPle.Api.OpenApi;
+using SimPle.Api.Realtime;
 using SimPle.Application;
 using SimPle.Application.Auth.Validators;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
 using SimPle.Application.GameHost.Services;
+using SimPle.Application.Realtime.Contracts;
 using SimPle.Domain.GameHost;
 using SimPle.Domain.Games;
 using SimPle.Domain.Lobbies;
@@ -90,6 +93,37 @@ builder.Services.AddFluentValidationAutoValidation();
 builder.Services.AddValidatorsFromAssemblyContaining<RegisterRequestValidator>();
 builder.Services.AddApplicationServices();
 builder.Services.AddInfrastructureServices(builder.Configuration);
+
+// Module 7 (docs/specs/module-07-realtime-presence-chat-spec.md), backend session A (M07-B1): transport,
+// authorization, presence only — no chat, no migration. The 16 KiB caps are enforced twice, deliberately: once
+// as the hub-wide message size (MaximumReceiveMessageSize, a HubOptions concern) and once as the connection's
+// buffer size (ApplicationMaxBufferSize, set where the hub is mapped below) — neither is ever set to 0 (which
+// would disable the limit entirely rather than bound it).
+builder.Services.AddOptions<RealtimeOptions>()
+    .Bind(builder.Configuration.GetSection(RealtimeOptions.SectionName))
+    .Validate(
+        options => options.AllowedOrigins.Length > 0 && options.AllowedOrigins.All(o => o != "*"),
+        "Realtime:AllowedOrigins must list one or more exact origins and must never contain a wildcard.")
+    .ValidateOnStart();
+
+builder.Services.AddSignalR(options =>
+{
+    options.MaximumReceiveMessageSize = 16 * 1024;
+    // MaximumParallelInvocationsPerClient is deliberately left unset — the default of 1 is exactly what B1
+    // relies on (see config tests asserting this default is untouched).
+});
+
+// Maps SignalR's "user" to the JWT sub claim, matching every other consumer of the access_token cookie.
+builder.Services.AddSingleton<Microsoft.AspNetCore.SignalR.IUserIdProvider, SubjectUserIdProvider>();
+builder.Services.AddSingleton<RealtimeConnectionTracker>();
+
+// These two need the concrete RealtimeHub type (via IHubContext<RealtimeHub, IRealtimeClient>), which
+// Infrastructure cannot reference — hence registered here rather than in AddInfrastructureServices. The
+// IRealtimeConnectionCloser registration below deliberately overrides AddInfrastructureServices' no-op default
+// now that the hub actually exists.
+builder.Services.AddSingleton<IRealtimeNotifier, RealtimeNotifier>();
+builder.Services.AddSingleton<IRealtimeConnectionCloser, RealtimeConnectionCloser>();
+
 builder.Services.AddHealthChecks()
     .AddCheck<DatabaseReadinessHealthCheck>("database", tags: ["ready"])
     .AddCheck<StorageConfigurationHealthCheck>("storage-configuration", tags: ["ready"])
@@ -189,11 +223,25 @@ builder.Services.AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationSc
     });
 builder.Services.AddAuthorization();
 
-builder.Services.AddCors(options => options.AddPolicy("AllowFrontend", policy =>
-    policy.WithOrigins(builder.Configuration["Cors:AllowedOrigin"] ?? "http://localhost:3000")
-        .AllowAnyHeader()
-        .AllowAnyMethod()
-        .AllowCredentials()));
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend", policy =>
+        policy.WithOrigins(builder.Configuration["Cors:AllowedOrigin"] ?? "http://localhost:3000")
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials());
+
+    // Realtime hub CORS: exact-origin only, sourced from the same Realtime:AllowedOrigins list the handshake
+    // middleware (RealtimeOriginValidationMiddleware) enforces directly — browsers do not apply CORS to
+    // WebSocket upgrades, so this policy alone would not be sufficient; both exist together deliberately.
+    var realtimeAllowedOrigins = builder.Configuration.GetSection("Realtime:AllowedOrigins").Get<string[]>()
+        ?? Array.Empty<string>();
+    options.AddPolicy("RealtimeHub", policy =>
+        policy.WithOrigins(realtimeAllowedOrigins)
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials());
+});
 
 builder.Services.AddOptions<GoogleOptions>()
     .Bind(builder.Configuration.GetSection(GoogleOptions.SectionName))
@@ -425,6 +473,7 @@ app.UseForwardedHeaders();
 app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 app.UseMiddleware<SecurityHeadersMiddleware>();
+app.UseMiddleware<RealtimeOriginValidationMiddleware>();
 
 if (app.Environment.IsDevelopment())
 {
@@ -445,6 +494,22 @@ app.UseRateLimiter();      // can now read authenticated subject claim for per-u
 app.UseAuthorization();
 
 app.MapControllers();
+
+// The single authenticated realtime endpoint (docs/specs/module-07-realtime-presence-chat-spec.md). Reuses the
+// same JWT cookie auth as REST (OnMessageReceived/OnTokenValidated above) — [Authorize] on RealtimeHub is what
+// enforces it. CloseOnAuthenticationExpiration closes a connection the instant its token naturally expires; it
+// is only one of three independent mechanisms the authorization model needs (see "the load-bearing rule" in the
+// spec) — proactive close (AuthService -> IRealtimeConnectionCloser) and the per-method scope recheck
+// (IRealtimeScopeAuthorizer, called from inside RealtimeHub) are the other two, and none of the three is
+// sufficient alone. ApplicationMaxBufferSize bounds the connection's receive buffer at the same 16 KiB as
+// HubOptions.MaximumReceiveMessageSize above — neither is ever set to 0, which would disable the limit.
+app.MapHub<RealtimeHub>("/hubs/realtime", options =>
+{
+    options.CloseOnAuthenticationExpiration = true;
+    options.ApplicationMaxBufferSize = 16 * 1024;
+    options.TransportMaxBufferSize = 16 * 1024;
+}).RequireCors("RealtimeHub");
+
 app.MapHealthChecks("/health/live", new HealthCheckOptions
 {
     // A liveness probe answers only whether this process can serve HTTP. It must never restart the container because

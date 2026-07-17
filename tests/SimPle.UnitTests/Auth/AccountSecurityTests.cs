@@ -22,6 +22,7 @@ public sealed class AccountSecurityTests
     private readonly IEmailService _emailService = Substitute.For<IEmailService>();
     private readonly IGoogleTokenValidationService _googleValidator = Substitute.For<IGoogleTokenValidationService>();
     private readonly IRevokedJtiStore _revokedJtis = Substitute.For<IRevokedJtiStore>();
+    private readonly IRealtimeConnectionCloser _realtimeCloser = Substitute.For<IRealtimeConnectionCloser>();
     private readonly AuthService _service;
 
     public AccountSecurityTests()
@@ -35,6 +36,7 @@ public sealed class AccountSecurityTests
             _users, _tokens, _verificationTokens, _resetTokens,
             _hasher, _tokenService, _emailService, _googleValidator,
             _revokedJtis,
+            _realtimeCloser,
             Options.Create(new AuthOptions { RefreshTokenExpiryDays = 7, MaxFailedLoginAttempts = 10, LockoutDurationMinutes = 15 }),
             Options.Create(new EmailOptions { AppUrl = "http://localhost:3000", SmtpHost = "smtp.test", Password = "x" }),
             NullLogger<AuthService>.Instance);

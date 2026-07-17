@@ -28,17 +28,20 @@ public sealed class OutboxDispatcherWorker : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly OutboxOptions _options;
+    private readonly TimeProvider _clock;
     private readonly ILogger<OutboxDispatcherWorker> _logger;
     private readonly IWorkerReadinessRegistry _readiness;
 
     public OutboxDispatcherWorker(
         IServiceScopeFactory scopeFactory,
         IOptions<OutboxOptions> options,
+        TimeProvider clock,
         ILogger<OutboxDispatcherWorker> logger,
         IWorkerReadinessRegistry readiness)
     {
         _scopeFactory = scopeFactory;
         _options = options.Value;
+        _clock = clock;
         _logger = logger;
         _readiness = readiness;
     }
@@ -51,6 +54,16 @@ public sealed class OutboxDispatcherWorker : BackgroundService
             _readiness.MarkUnhealthy(RequiredWorkers.OutboxDispatcher);
             return;
         }
+
+        // Every handler's activation watermark (docs/specs/module-07-realtime-presence-chat-spec.md, "Activation
+        // watermark") must be captured here, before the loop below ever leases a message — not lazily, inside
+        // HandleAsync, on whichever pass first happens to find something leasable. GetOrActivateAsync's watermark
+        // is MAX(OccurredAtUtc, Id) over the outbox *at the moment its query runs*; if that query is deferred until
+        // a live event has already landed, the query sees its own event as the table's current maximum and
+        // classifies it as pre-existing history, silently dropping it rather than fanning it out. Activating here,
+        // before this process can have leased anything, keeps the watermark anchored to "before this process
+        // existed" rather than to an arbitrary later instant that a fast-moving live event can race into.
+        await ActivateAllHandlersAsync(stoppingToken);
 
         _readiness.MarkStarted(RequiredWorkers.OutboxDispatcher);
 
@@ -70,6 +83,29 @@ public sealed class OutboxDispatcherWorker : BackgroundService
             {
                 break;
             }
+        }
+    }
+
+    private async Task ActivateAllHandlersAsync(CancellationToken ct)
+    {
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var activation = scope.ServiceProvider.GetRequiredService<IOutboxActivationStore>();
+            var handlers = scope.ServiceProvider.GetServices<IOutboxHandler>();
+            var nowUtc = _clock.GetUtcNow().UtcDateTime;
+
+            foreach (var handler in handlers)
+            {
+                if (ct.IsCancellationRequested) break;
+                await activation.GetOrActivateAsync(handler.HandlerName, handler.EventTypes, nowUtc, ct);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Not fatal: an un-activated handler simply activates lazily on its first HandleAsync call instead,
+            // which is the pre-existing (racy) behavior this method exists to avoid — not a new failure mode.
+            _logger.LogError(ex, "Eager outbox handler activation failed; handlers will activate lazily instead.");
         }
     }
 

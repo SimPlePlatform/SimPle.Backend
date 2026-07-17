@@ -19,6 +19,7 @@ public sealed class AuthService : IAuthService
     private readonly IEmailService _email;
     private readonly IGoogleTokenValidationService _googleValidator;
     private readonly IRevokedJtiStore _revokedJtis;
+    private readonly IRealtimeConnectionCloser _realtimeCloser;
     private readonly AuthOptions _authOptions;
     private readonly EmailOptions _emailOptions;
     private readonly ILogger<AuthService> _logger;
@@ -33,6 +34,7 @@ public sealed class AuthService : IAuthService
         IEmailService email,
         IGoogleTokenValidationService googleValidator,
         IRevokedJtiStore revokedJtis,
+        IRealtimeConnectionCloser realtimeCloser,
         IOptions<AuthOptions> authOptions,
         IOptions<EmailOptions> emailOptions,
         ILogger<AuthService> logger)
@@ -46,6 +48,7 @@ public sealed class AuthService : IAuthService
         _email = email;
         _googleValidator = googleValidator;
         _revokedJtis = revokedJtis;
+        _realtimeCloser = realtimeCloser;
         _authOptions = authOptions.Value;
         _emailOptions = emailOptions.Value;
         _logger = logger;
@@ -237,8 +240,19 @@ public sealed class AuthService : IAuthService
 
         if (stored is { IsRevoked: false })
         {
+            // Module 7: also revoke the session family, matching LogoutAllAsync/RevokeSessionAsync. Previously
+            // this method revoked only the refresh-token row, leaving a stale-but-still-valid access cookie live
+            // until natural expiry — harmless on plain REST, but a realtime hub connection would otherwise survive
+            // a "logout" indefinitely and simply reconnect with that cookie. This is an approved, intentional
+            // Module 1 behavior change (see docs/specs/module-07-realtime-presence-chat-spec.md).
+            _revokedJtis.Revoke(stored.FamilyId.ToString(), TimeSpan.FromMinutes(20));
+
             stored.Revoke("", "Logout");
             await _tokens.UpdateAsync(stored, ct);
+
+            // Realtime connections cache the authenticated principal for their lifetime and are not
+            // automatically revalidated — close them proactively rather than letting a live socket outlive logout.
+            await _realtimeCloser.CloseUserConnectionsAsync(stored.UserId, "auth.session_revoked", ct);
         }
 
         return Result.Ok();
@@ -252,6 +266,7 @@ public sealed class AuthService : IAuthService
             _revokedJtis.Revoke(t.FamilyId.ToString(), TimeSpan.FromMinutes(20));
 
         await _tokens.RevokeAllByUserIdAsync(userId, "Logout all", ct);
+        await _realtimeCloser.CloseUserConnectionsAsync(userId, "auth.session_revoked", ct);
         _logger.LogInformation("Security: Logout-all. UserId={UserId}", userId);
         return Result.Ok();
     }
@@ -517,6 +532,7 @@ public sealed class AuthService : IAuthService
 
         token.Revoke(string.Empty, "user_revoked");
         await _tokens.UpdateAsync(token, ct);
+        await _realtimeCloser.CloseUserConnectionsAsync(userId, "auth.session_revoked", ct);
         _logger.LogInformation("Session {SessionId} revoked by user {UserId}", sessionId, userId);
         return Result.Ok();
     }
@@ -531,6 +547,7 @@ public sealed class AuthService : IAuthService
 
         await _tokens.RevokeAllByUserIdAsync(userId, "account_deleted", ct);
         await _users.DeleteAsync(user, ct);
+        await _realtimeCloser.CloseUserConnectionsAsync(userId, "auth.session_revoked", ct);
         _logger.LogInformation("Account deleted for user {UserId}", userId);
         return Result.Ok();
     }

@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using SimPle.Domain.Capabilities;
+using SimPle.Domain.Chat;
 using SimPle.Domain.Friends;
 using SimPle.Domain.Games;
 using SimPle.Domain.Lobbies;
@@ -55,6 +56,11 @@ public class AppDbContext : DbContext
     // Additive; Module 4's catalog tables are not mutated.
     public DbSet<GameCapabilityProfile> GameCapabilityProfiles => Set<GameCapabilityProfile>();
     public DbSet<CapabilitySeedHistory> CapabilitySeedHistory => Set<CapabilitySeedHistory>();
+
+    // Module 7 — chat persistence & outbox handler activation watermarks
+    public DbSet<ChatMessage> ChatMessages => Set<ChatMessage>();
+    public DbSet<ChatMessageHold> ChatMessageHolds => Set<ChatMessageHold>();
+    public DbSet<OutboxHandlerActivation> OutboxHandlerActivations => Set<OutboxHandlerActivation>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

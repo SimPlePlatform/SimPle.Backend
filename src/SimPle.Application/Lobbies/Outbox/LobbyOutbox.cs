@@ -41,6 +41,11 @@ public static class LobbyOutbox
     public const string LobbyCredentialRotated = "LobbyCredentialRotatedV1";
     public const string MatchRequested = "MatchRequestedV1";
 
+    /// <summary>Added for M07-B2: <c>LobbyRealtimeHandler</c>'s one new consumed event type, so a readiness
+    /// toggle produces the same <c>LobbyChanged</c> hint every other Lobby-aggregate mutation does. Ids only,
+    /// matching every other event on this aggregate.</summary>
+    public const string LobbyReadinessChanged = "LobbyReadinessChangedV1";
+
     public static OutboxMessage LobbyCreatedEvent(Lobby lobby) =>
         LobbyEvent(lobby, LobbyCreated, new { lobbyId = lobby.Id, hostUserId = lobby.HostUserId, gameSlug = lobby.GameSlug });
 
@@ -65,6 +70,9 @@ public static class LobbyOutbox
     /// <summary>Rotation carries the generation only — never the old or new digest, let alone the plaintext.</summary>
     public static OutboxMessage CredentialRotatedEvent(Lobby lobby, int generation) =>
         LobbyEvent(lobby, LobbyCredentialRotated, new { lobbyId = lobby.Id, generation });
+
+    public static OutboxMessage ReadinessChangedEvent(Lobby lobby, Guid userId, bool isReady) =>
+        LobbyEvent(lobby, LobbyReadinessChanged, new { lobbyId = lobby.Id, userId, isReady });
 
     /// <summary>
     /// The event M8 consumes. Ids only: M8 re-reads the lobby it names rather than trusting a settings snapshot

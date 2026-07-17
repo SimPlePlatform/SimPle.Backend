@@ -23,6 +23,7 @@ public sealed class AuthServiceTests
     private readonly IEmailService _emailService = Substitute.For<IEmailService>();
     private readonly IGoogleTokenValidationService _googleValidator = Substitute.For<IGoogleTokenValidationService>();
     private readonly IRevokedJtiStore _revokedJtis = Substitute.For<IRevokedJtiStore>();
+    private readonly IRealtimeConnectionCloser _realtimeCloser = Substitute.For<IRealtimeConnectionCloser>();
     private readonly AuthService _service;
 
     public AuthServiceTests()
@@ -44,6 +45,7 @@ public sealed class AuthServiceTests
             _emailService,
             _googleValidator,
             _revokedJtis,
+            _realtimeCloser,
             Options.Create(new AuthOptions
             {
                 RefreshTokenExpiryDays = 7,
@@ -293,6 +295,30 @@ public sealed class AuthServiceTests
         token.IsRevoked.Should().BeTrue();
         await _tokens.Received(1).RevokeAllByUserIdAsync(
             user.Id, "Logout all", Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// Regression test for the Module 7 fix (docs/specs/module-07-realtime-presence-chat-spec.md): before this
+    /// fix, LogoutAsync revoked only the refresh-token row, never the session family — so a session logged out via
+    /// this path could still authenticate with a not-yet-expired access token cookie until it expired naturally
+    /// (LogoutAllAsync/RevokeSessionAsync already revoked the family; LogoutAsync did not). This also closes any
+    /// live realtime connections proactively, since a realtime hub connection would otherwise survive "logout"
+    /// indefinitely (see "the load-bearing rule" in the spec).
+    /// </summary>
+    [Fact]
+    public async Task LogoutAsync_RevokesSessionFamilyAndClosesRealtimeConnections()
+    {
+        var user = ExistingUser();
+        var token = RefreshToken.Create(user.Id, "hash-old-token", Guid.NewGuid(),
+            DateTime.UtcNow.AddDays(1), "", null);
+        _tokens.GetByHashAsync("hash-old-token", Arg.Any<CancellationToken>()).Returns(token);
+
+        await _service.LogoutAsync("old-token");
+
+        token.IsRevoked.Should().BeTrue();
+        _revokedJtis.Received(1).Revoke(token.FamilyId.ToString(), Arg.Any<TimeSpan>());
+        await _realtimeCloser.Received(1).CloseUserConnectionsAsync(
+            user.Id, "auth.session_revoked", Arg.Any<CancellationToken>());
     }
 
     // ── GetCurrentUser ────────────────────────────────────────────────────────

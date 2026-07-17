@@ -14,6 +14,10 @@ public static class RequiredWorkers
     public const string LobbyExpiry = "lobby-expiry";
     public const string OutboxDispatcher = "outbox-dispatcher";
 
+    /// <summary>Module 7, backend session B (M07-B2): the chat retention sweep
+    /// (<see cref="SimPle.Infrastructure.Chat.ChatRetentionSweeper"/>).</summary>
+    public const string ChatRetention = "chat-retention";
+
     public static readonly IReadOnlyCollection<string> All =
     [
         TokenCleanup,
@@ -21,6 +25,7 @@ public static class RequiredWorkers
         Matchmaking,
         LobbyExpiry,
         OutboxDispatcher,
+        ChatRetention,
     ];
 }
 
