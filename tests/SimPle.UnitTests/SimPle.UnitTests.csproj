@@ -11,7 +11,7 @@
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.0" />
-    <PackageReference Include="FluentAssertions" Version="6.12.0" />
+    <PackageReference Include="FluentAssertions" Version="8.10.0" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="8.0.2" />
     <!-- FakeTimeProvider. Module 6's band boundaries (15/30/60s) and its 2h/30min expiries are only provable with
          an injected, controllable clock — a wall-clock test cannot prove a boundary transition (brief Risk #8). -->
