@@ -10,6 +10,8 @@ using SimPle.Application.Outbox;
 using SimPle.Application.Outbox.Handlers;
 using SimPle.Application.People.Services;
 using SimPle.Application.Profiles.Services;
+using SimPle.Application.Realtime.Authorization;
+using SimPle.Application.Realtime.Presence;
 
 namespace SimPle.Application;
 
@@ -41,6 +43,19 @@ public static class DependencyInjection
         // no Phase 2 game is hosted yet), not something this generic module wiring can supply.
         services.AddScoped<IGameHostInvoker, GameHostInvoker>();
         services.AddScoped<ICatalogEngineCompatibilityValidator, CatalogEngineCompatibilityValidator>();
+
+        // Module 7 (docs/specs/module-07-realtime-presence-chat-spec.md), backend session A (M07-B1): transport,
+        // authorization, presence only — no chat, no migration. IPresenceRegistry is a process-lifetime singleton
+        // (in-memory only, no cross-instance sync; see spec Risk Register). Both scope authorizers are registered
+        // even though only "lobby" has a caller in B1 — NullMatchScopeAuthorizer exists so a request against a
+        // scope kind with no real authorizer yet fails closed with realtime.scope_not_available rather than 500ing.
+        services.AddSingleton<IPresenceRegistry, PresenceRegistry>();
+        services.AddScoped<IRealtimeScopeAuthorizer, LobbyScopeAuthorizer>();
+        services.AddScoped<IRealtimeScopeAuthorizer, NullMatchScopeAuthorizer>();
+
+        // Scoped, matching its ILobbyRepository dependency (EF Core's DbContext is scoped) — resolves who should
+        // see a PresenceChanged broadcast (self + current lobby co-members, block-filtered).
+        services.AddScoped<IPresenceViewerResolver, PresenceViewerResolver>();
 
         return services;
     }

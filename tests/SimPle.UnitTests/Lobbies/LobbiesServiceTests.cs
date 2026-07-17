@@ -280,7 +280,7 @@ public sealed class LobbiesServiceTests
 
         // 3. Correct, live credential — but the lobby behind it has closed.
         var closedLobby = LobbyTestFactory.Open(_host, T0);
-        closedLobby.Close(LobbyClosedReason.HostClosed);
+        closedLobby.Close(LobbyClosedReason.HostClosed, T0);
         var closedCred = IssuedCredential(closedLobby.Id, "CLOSED");
         _repo.FindActiveByCodeDigestAsync("hash:CLOSED", Arg.Any<CancellationToken>()).Returns(closedCred);
         _repo.GetForUpdateAsync(closedLobby.Id, Arg.Any<CancellationToken>()).Returns(closedLobby);
@@ -425,7 +425,7 @@ public sealed class LobbiesServiceTests
         var private_ = await _sut.JoinByCredentialAsync(_joiner, new JoinLobbyRequestDto(null, null, privateLobby.Id));
 
         var closedLobby = LobbyTestFactory.Open(_host, T0, LobbyTestFactory.Settings(privacy: LobbyPrivacy.Public));
-        closedLobby.Close(LobbyClosedReason.HostClosed);
+        closedLobby.Close(LobbyClosedReason.HostClosed, T0);
         _repo.GetForUpdateAsync(closedLobby.Id, Arg.Any<CancellationToken>()).Returns(closedLobby);
         var closed = await _sut.JoinByCredentialAsync(_joiner, new JoinLobbyRequestDto(null, null, closedLobby.Id));
 

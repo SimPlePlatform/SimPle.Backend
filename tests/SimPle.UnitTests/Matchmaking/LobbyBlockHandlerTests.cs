@@ -130,7 +130,7 @@ public sealed class LobbyBlockHandlerTests
     public async Task ATerminalLobbyIsLeftAlone()
     {
         var lobby = GivenSharedLobby();
-        lobby.Close(LobbyClosedReason.HostLeft);
+        lobby.Close(LobbyClosedReason.HostLeft, T0);
 
         await _sut.HandleAsync(BlockEvent(blocker: _host, blocked: _member));
 

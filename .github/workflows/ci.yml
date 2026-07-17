@@ -6,30 +6,138 @@ on:
   pull_request:
     branches: ["main"]
 
+# Keep the normal validation token read-only. Artifact provenance gets its write
+# permissions only in the dedicated, push-only job below.
+permissions:
+  contents: read
+
 jobs:
   backend:
-    name: Build, test, vulnerability scan
+    name: Build, test, package, and container smoke
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      MIGRATION_TEST_CONNECTION_STRING: Host=localhost;Port=5432;Database=postgres;Username=postgres;Password=postgres
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Set up .NET 8
-        uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: "8.0.x"
 
       - name: Restore
-        run: dotnet restore
+        # NuGet lock files are not in the repository yet. Do not use
+        # --locked-mode until they are intentionally committed, or every CI
+        # run would fail before it can test the application.
+        run: dotnet restore SimPle.sln
 
       - name: Build
-        run: dotnet build --no-restore --configuration Release
+        run: dotnet build SimPle.sln --no-restore --configuration Release
 
       - name: Unit tests
-        run: dotnet test tests/SimPle.UnitTests/SimPle.UnitTests.csproj --no-build --configuration Release
+        run: dotnet test tests/SimPle.UnitTests/SimPle.UnitTests.csproj --no-build --configuration Release --logger "trx;LogFileName=unit.trx" --results-directory TestResults
 
-      - name: Integration tests
-        run: dotnet test tests/SimPle.IntegrationTests/SimPle.IntegrationTests.csproj --no-build --configuration Release
+      - name: Integration and real-PostgreSQL migration tests
+        run: dotnet test tests/SimPle.IntegrationTests/SimPle.IntegrationTests.csproj --no-build --configuration Release --logger "trx;LogFileName=integration.trx" --results-directory TestResults
 
-      - name: NuGet vulnerability scan
-        run: dotnet list package --vulnerable
+      - name: Fail on high or critical NuGet vulnerabilities
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet list SimPle.sln package --vulnerable --include-transitive | tee TestResults/nuget-vulnerabilities.txt
+          if grep -Eq ' (High|Critical) ' TestResults/nuget-vulnerabilities.txt; then
+            echo "High or critical NuGet vulnerability found. Update it or add an owned, time-bounded waiver."
+            exit 1
+          fi
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          dotnet tool install --tool-path .tools cyclonedx --version 6.2.0
+          ./.tools/dotnet-CycloneDX SimPle.sln --output artifacts/sbom --json
+
+      - name: Build container image
+        run: docker build --tag simple-backend:${{ github.sha }} .
+
+      - name: Smoke the non-root, read-only container
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Liveness deliberately proves only that the process serves HTTP. The
+          # integration job above owns real PostgreSQL migration verification;
+          # readiness is expected to stay unhealthy until a migration job runs.
+          docker run --detach --name simple-backend-smoke --network host \
+            --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec \
+            -e 'ConnectionStrings__DefaultConnection=Host=localhost;Port=5432;Database=postgres;Username=postgres;Password=postgres' \
+            -e 'Jwt__SecretKey=ci-smoke-jwt-secret-that-is-at-least-thirty-two-characters' \
+            -e 'LobbyCredential__Key=ci-smoke-lobby-key-that-is-at-least-thirty-two-characters' \
+            -e 'Recaptcha__SecretKey=ci-smoke-recaptcha-secret' \
+            -e 'Google__ClientId=ci-smoke.apps.googleusercontent.com' \
+            -e 'Email__SmtpHost=localhost' \
+            -e 'Email__Username=ci-smoke@example.test' \
+            -e 'Email__Password=ci-smoke-password' \
+            -e 'Email__From=ci-smoke@example.test' \
+            -e 'Google__ClientId=ci-smoke-google-client-id' \
+            -e 'Storage__Provider=S3Compatible' \
+            -e 'Storage__BucketName=ci-smoke-assets' \
+            -e 'Storage__Region=us-east-1' \
+            -e 'Storage__AccessKey=ci-smoke-access-key' \
+            -e 'Storage__SecretKey=ci-smoke-secret-key' \
+            -e 'Storage__ProfilePrefix=profile-assets' \
+            simple-backend:${{ github.sha }}
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:8080/health/live | grep -qx '{"status":"healthy"}'; then
+              docker exec simple-backend-smoke id | grep -q 'uid=1654(app)'
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs simple-backend-smoke
+          exit 1
+
+      - name: Remove smoke container
+        if: always()
+        run: docker rm --force simple-backend-smoke || true
+
+      - name: Upload test and SBOM evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backend-evidence-${{ github.sha }}
+          path: |
+            TestResults/
+            artifacts/sbom/
+          if-no-files-found: error
+          retention-days: 30
+
+  attest-sbom:
+    name: Attest backend SBOM
+    needs: backend
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: backend-evidence-${{ github.sha }}
+          path: evidence
+
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: evidence/artifacts/sbom/*.json

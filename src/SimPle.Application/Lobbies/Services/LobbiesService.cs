@@ -349,7 +349,7 @@ public sealed class LobbiesService : ILobbiesService
             var outcome = lobby.SetReadiness(actorUserId, request.IsReady, nowUtc);
             if (outcome != LobbyOutcome.Ok) return MapOutcome<LobbyDto>(outcome);
 
-            await _lobbies.SaveAsync(Array.Empty<OutboxMessage>(), token);
+            await _lobbies.SaveAsync(new[] { LobbyOutbox.ReadinessChangedEvent(lobby, actorUserId, request.IsReady) }, token);
             return Result<LobbyDto>.Ok(await ProjectAsync(lobby, actorUserId, token));
         }, ct);
 

@@ -6,20 +6,26 @@ using DotNetEnv.Configuration;
 using FluentValidation;
 using FluentValidation.AspNetCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
 using Microsoft.IdentityModel.Tokens;
+using SimPle.Api.Hubs;
 using SimPle.Api.Middleware;
+using SimPle.Api.Health;
 using SimPle.Api.Models;
 using SimPle.Api.OpenApi;
+using SimPle.Api.Realtime;
 using SimPle.Application;
 using SimPle.Application.Auth.Validators;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
 using SimPle.Application.GameHost.Services;
+using SimPle.Application.Realtime.Contracts;
 using SimPle.Domain.GameHost;
 using SimPle.Domain.Games;
 using SimPle.Domain.Lobbies;
@@ -30,6 +36,17 @@ using SimPle.Infrastructure.Games;
 using SimPle.Infrastructure.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Container platforms consume structured stdout. Development keeps the familiar readable console provider while
+// production JSON includes logging scopes such as CorrelationId for request-to-log and request-to-response tracing.
+if (!builder.Environment.IsDevelopment())
+{
+    builder.Logging.ClearProviders();
+    builder.Logging.AddJsonConsole(options => options.IncludeScopes = true);
+    // EF parameter values are redacted by default, but command text is still high-volume operational noise and can
+    // reveal data shape. Keep production logs structured and useful without turning them into a query transcript.
+    builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Command", LogLevel.Warning);
+}
 
 if (builder.Environment.IsDevelopment())
 {
@@ -76,6 +93,41 @@ builder.Services.AddFluentValidationAutoValidation();
 builder.Services.AddValidatorsFromAssemblyContaining<RegisterRequestValidator>();
 builder.Services.AddApplicationServices();
 builder.Services.AddInfrastructureServices(builder.Configuration);
+
+// Module 7 (docs/specs/module-07-realtime-presence-chat-spec.md), backend session A (M07-B1): transport,
+// authorization, presence only — no chat, no migration. The 16 KiB caps are enforced twice, deliberately: once
+// as the hub-wide message size (MaximumReceiveMessageSize, a HubOptions concern) and once as the connection's
+// buffer size (ApplicationMaxBufferSize, set where the hub is mapped below) — neither is ever set to 0 (which
+// would disable the limit entirely rather than bound it).
+builder.Services.AddOptions<RealtimeOptions>()
+    .Bind(builder.Configuration.GetSection(RealtimeOptions.SectionName))
+    .Validate(
+        options => options.AllowedOrigins.Length > 0 && options.AllowedOrigins.All(o => o != "*"),
+        "Realtime:AllowedOrigins must list one or more exact origins and must never contain a wildcard.")
+    .ValidateOnStart();
+
+builder.Services.AddSignalR(options =>
+{
+    options.MaximumReceiveMessageSize = 16 * 1024;
+    // MaximumParallelInvocationsPerClient is deliberately left unset — the default of 1 is exactly what B1
+    // relies on (see config tests asserting this default is untouched).
+});
+
+// Maps SignalR's "user" to the JWT sub claim, matching every other consumer of the access_token cookie.
+builder.Services.AddSingleton<Microsoft.AspNetCore.SignalR.IUserIdProvider, SubjectUserIdProvider>();
+builder.Services.AddSingleton<RealtimeConnectionTracker>();
+
+// These two need the concrete RealtimeHub type (via IHubContext<RealtimeHub, IRealtimeClient>), which
+// Infrastructure cannot reference — hence registered here rather than in AddInfrastructureServices. The
+// IRealtimeConnectionCloser registration below deliberately overrides AddInfrastructureServices' no-op default
+// now that the hub actually exists.
+builder.Services.AddSingleton<IRealtimeNotifier, RealtimeNotifier>();
+builder.Services.AddSingleton<IRealtimeConnectionCloser, RealtimeConnectionCloser>();
+
+builder.Services.AddHealthChecks()
+    .AddCheck<DatabaseReadinessHealthCheck>("database", tags: ["ready"])
+    .AddCheck<StorageConfigurationHealthCheck>("storage-configuration", tags: ["ready"])
+    .AddCheck<WorkerReadinessHealthCheck>("background-workers", tags: ["ready"]);
 
 // The composition root's list of installed Phase 2 game engines. Empty today — Module 5 hosts no product
 // game yet, only the test-only HiddenTokenDraft reference engine, which is never registered here. A duplicate
@@ -171,11 +223,25 @@ builder.Services.AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationSc
     });
 builder.Services.AddAuthorization();
 
-builder.Services.AddCors(options => options.AddPolicy("AllowFrontend", policy =>
-    policy.WithOrigins(builder.Configuration["Cors:AllowedOrigin"] ?? "http://localhost:3000")
-        .AllowAnyHeader()
-        .AllowAnyMethod()
-        .AllowCredentials()));
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend", policy =>
+        policy.WithOrigins(builder.Configuration["Cors:AllowedOrigin"] ?? "http://localhost:3000")
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials());
+
+    // Realtime hub CORS: exact-origin only, sourced from the same Realtime:AllowedOrigins list the handshake
+    // middleware (RealtimeOriginValidationMiddleware) enforces directly — browsers do not apply CORS to
+    // WebSocket upgrades, so this policy alone would not be sufficient; both exist together deliberately.
+    var realtimeAllowedOrigins = builder.Configuration.GetSection("Realtime:AllowedOrigins").Get<string[]>()
+        ?? Array.Empty<string>();
+    options.AddPolicy("RealtimeHub", policy =>
+        policy.WithOrigins(realtimeAllowedOrigins)
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials());
+});
 
 builder.Services.AddOptions<GoogleOptions>()
     .Bind(builder.Configuration.GetSection(GoogleOptions.SectionName))
@@ -255,7 +321,6 @@ builder.Services.AddRateLimiter(options =>
         }
 
         // Security event (brief: rate-limit rejections are logged with actor, target, action, result).
-        // No correlation-id infrastructure exists in this codebase yet (pre-existing gap, tracked separately).
         var rateLimitLogger = context.HttpContext.RequestServices
             .GetRequiredService<ILoggerFactory>().CreateLogger("RateLimiting");
         var policyName = context.HttpContext.GetEndpoint()?.Metadata
@@ -405,8 +470,10 @@ using (var startupScope = app.Services.CreateScope())
 
 // Must be first — sets RemoteIpAddress from X-Forwarded-For before any other middleware reads it.
 app.UseForwardedHeaders();
+app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 app.UseMiddleware<SecurityHeadersMiddleware>();
+app.UseMiddleware<RealtimeOriginValidationMiddleware>();
 
 if (app.Environment.IsDevelopment())
 {
@@ -427,7 +494,46 @@ app.UseRateLimiter();      // can now read authenticated subject claim for per-u
 app.UseAuthorization();
 
 app.MapControllers();
+
+// The single authenticated realtime endpoint (docs/specs/module-07-realtime-presence-chat-spec.md). Reuses the
+// same JWT cookie auth as REST (OnMessageReceived/OnTokenValidated above) — [Authorize] on RealtimeHub is what
+// enforces it. CloseOnAuthenticationExpiration closes a connection the instant its token naturally expires; it
+// is only one of three independent mechanisms the authorization model needs (see "the load-bearing rule" in the
+// spec) — proactive close (AuthService -> IRealtimeConnectionCloser) and the per-method scope recheck
+// (IRealtimeScopeAuthorizer, called from inside RealtimeHub) are the other two, and none of the three is
+// sufficient alone. ApplicationMaxBufferSize bounds the connection's receive buffer at the same 16 KiB as
+// HubOptions.MaximumReceiveMessageSize above — neither is ever set to 0, which would disable the limit.
+app.MapHub<RealtimeHub>("/hubs/realtime", options =>
+{
+    options.CloseOnAuthenticationExpiration = true;
+    options.ApplicationMaxBufferSize = 16 * 1024;
+    options.TransportMaxBufferSize = 16 * 1024;
+}).RequireCors("RealtimeHub");
+
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    // A liveness probe answers only whether this process can serve HTTP. It must never restart the container because
+    // PostgreSQL, storage, or a background worker is temporarily unavailable.
+    Predicate = _ => false,
+    ResponseWriter = WriteHealthResponse,
+});
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = registration => registration.Tags.Contains("ready"),
+    ResponseWriter = WriteHealthResponse,
+});
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", utc = DateTime.UtcNow }));
+
+static Task WriteHealthResponse(HttpContext context, HealthReport report)
+{
+    // Dependency names, connection errors, pending migration IDs, and worker state stay out of this public endpoint.
+    // The HTTP status and this single status field are sufficient for Container Apps / Caddy probes.
+    context.Response.ContentType = "application/json";
+    return context.Response.WriteAsJsonAsync(new
+    {
+        status = report.Status == HealthStatus.Healthy ? "healthy" : "unhealthy",
+    });
+}
 
 static RateLimitPartition<string> AuthWindow(HttpContext context, int permitLimit, TimeSpan window) =>
     RateLimitPartition.GetFixedWindowLimiter(
@@ -457,6 +563,39 @@ static RateLimitPartition<string> FriendWindow(HttpContext context, string prefi
             QueueLimit = 0,
             QueueProcessingOrder = QueueProcessingOrder.OldestFirst
         });
+}
+
+// Explicit, one-shot release jobs. They reuse the application composition root so migrations and seeders use the
+// same configuration and provider as the running API, but they never start the HTTP server or background workers.
+// A deployment must invoke them one at a time and record their exit code as release evidence.
+if (args.Contains("--apply-migrations"))
+{
+    using var scope = app.Services.CreateScope();
+    var migrationDb = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    migrationDb.Database.Migrate();
+    Console.WriteLine("Database migrations applied successfully.");
+    Environment.Exit(0);
+}
+
+if (args.Contains("--seed"))
+{
+    using var scope = app.Services.CreateScope();
+    var seedDb = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var seedLogger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger<GameCatalogSeeder>();
+    var gameSeeder = new GameCatalogSeeder(seedDb, seedLogger);
+    var gameResult = gameSeeder.SeedAsync().GetAwaiter().GetResult();
+    if (!gameResult.Success)
+    {
+        Console.Error.WriteLine(gameResult.Message);
+        Environment.Exit(1);
+    }
+
+    var capabilityClock = scope.ServiceProvider.GetRequiredService<TimeProvider>();
+    var capabilityLogger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger<GameCapabilitySeeder>();
+    var capabilitySeeder = new GameCapabilitySeeder(seedDb, capabilityClock, capabilityLogger);
+    var capabilityResult = capabilitySeeder.SeedAsync().GetAwaiter().GetResult();
+    Console.WriteLine(capabilityResult.Message);
+    Environment.Exit(capabilityResult.Success ? 0 : 1);
 }
 
 if (args.Contains("--seed-game-catalog"))

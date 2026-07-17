@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SimPle.Application.Common.Options;
 using SimPle.Application.Expiry;
+using SimPle.Infrastructure.Health;
 
 namespace SimPle.Infrastructure.Matchmaking;
 
@@ -23,15 +24,18 @@ public sealed class LobbyExpiryWorker : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ExpiryOptions _options;
     private readonly ILogger<LobbyExpiryWorker> _logger;
+    private readonly IWorkerReadinessRegistry _readiness;
 
     public LobbyExpiryWorker(
         IServiceScopeFactory scopeFactory,
         IOptions<ExpiryOptions> options,
-        ILogger<LobbyExpiryWorker> logger)
+        ILogger<LobbyExpiryWorker> logger,
+        IWorkerReadinessRegistry readiness)
     {
         _scopeFactory = scopeFactory;
         _options = options.Value;
         _logger = logger;
+        _readiness = readiness;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -39,8 +43,11 @@ public sealed class LobbyExpiryWorker : BackgroundService
         if (!_options.WorkerEnabled)
         {
             _logger.LogInformation("Lobby expiry worker is disabled by configuration; not starting.");
+            _readiness.MarkUnhealthy(RequiredWorkers.LobbyExpiry);
             return;
         }
+
+        _readiness.MarkStarted(RequiredWorkers.LobbyExpiry);
 
         _logger.LogInformation(
             "Lobby expiry worker started. Interval={Interval} BatchSize={BatchSize}",
@@ -79,9 +86,12 @@ public sealed class LobbyExpiryWorker : BackgroundService
                     "Expiry lag exceeded the 5s budget. MaxTicketLagMs={LagMs} Tickets={Tickets}",
                     (long)result.MaxTicketLag.TotalMilliseconds, result.TicketsExpired);
             }
+
+            _readiness.MarkHealthy(RequiredWorkers.LobbyExpiry);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            _readiness.MarkUnhealthy(RequiredWorkers.LobbyExpiry);
             // Idempotent by construction: every transition it drives is a TryExpire/TryTimeOut that returns false
             // rather than transitioning twice, so a failed sweep leaves nothing half-done and the next tick simply
             // sees the same overdue rows.

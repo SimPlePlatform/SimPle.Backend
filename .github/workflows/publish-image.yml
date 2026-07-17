@@ -1,0 +1,53 @@
+name: Publish immutable backend image
+
+on:
+  workflow_dispatch:
+
+# Run this only for an already-green commit on main. The resulting digest and
+# provenance attestation are release evidence; a mutable tag is never enough.
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish and attest backend image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ghcr.io/simpleplatform/simple-backend
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable candidate
+        id: push
+        uses: docker/build-push-action@ee4ca427a2f43b6a16632044ca514c076267da23 # v6.19.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Attest image build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record digest in job summary
+        run: |
+          echo '### Immutable backend image' >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${IMAGE_NAME}@${{ steps.push.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"

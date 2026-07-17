@@ -139,6 +139,101 @@ namespace SimPle.Infrastructure.Migrations
                         });
                 });
 
+            modelBuilder.Entity("SimPle.Domain.Chat.ChatMessage", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Body")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<Guid>("ClientCommandId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("DeletedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid?>("DeletedByUserId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("RetainUntilUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("SchemaVersion")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(1);
+
+                    b.Property<int>("Scope")
+                        .HasColumnType("integer");
+
+                    b.Property<Guid>("ScopeId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("SenderId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RetainUntilUtc")
+                        .HasDatabaseName("ix_chat_messages_retain");
+
+                    b.HasIndex("SenderId", "ClientCommandId")
+                        .IsUnique()
+                        .HasDatabaseName("ux_chat_messages_sender_command");
+
+                    b.HasIndex("Scope", "ScopeId", "CreatedAt", "Id")
+                        .HasDatabaseName("ix_chat_messages_scope_created_id");
+
+                    b.ToTable("chat_messages", (string)null);
+                });
+
+            modelBuilder.Entity("SimPle.Domain.Chat.ChatMessageHold", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime?>("AcknowledgedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid>("MessageId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("PlacedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ReasonCode")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime?>("ReleasedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("MessageId")
+                        .HasDatabaseName("ix_chat_message_holds_active")
+                        .HasFilter("\"ReleasedAtUtc\" IS NULL");
+
+                    b.ToTable("chat_message_holds", (string)null);
+                });
+
             modelBuilder.Entity("SimPle.Domain.Friends.Block", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1130,6 +1225,26 @@ namespace SimPle.Infrastructure.Migrations
                     b.ToTable("outbox_deliveries", (string)null);
                 });
 
+            modelBuilder.Entity("SimPle.Domain.Outbox.OutboxHandlerActivation", b =>
+                {
+                    b.Property<string>("HandlerName")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<DateTime>("ActivatedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid?>("WatermarkEventId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("WatermarkOccurredAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("HandlerName");
+
+                    b.ToTable("outbox_handler_activations", (string)null);
+                });
+
             modelBuilder.Entity("SimPle.Domain.Outbox.OutboxMessage", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1657,6 +1772,24 @@ namespace SimPle.Infrastructure.Migrations
                         .WithMany()
                         .HasForeignKey("GameSlug")
                         .HasPrincipalKey("Slug")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("SimPle.Domain.Chat.ChatMessage", b =>
+                {
+                    b.HasOne("SimPle.Domain.Users.User", null)
+                        .WithMany()
+                        .HasForeignKey("SenderId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("SimPle.Domain.Chat.ChatMessageHold", b =>
+                {
+                    b.HasOne("SimPle.Domain.Chat.ChatMessage", null)
+                        .WithMany()
+                        .HasForeignKey("MessageId")
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
                 });

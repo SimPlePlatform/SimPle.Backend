@@ -24,10 +24,15 @@ public sealed class NoMatchRuntimeProbe : IMatchRuntimeProbe
         Task.FromResult(false);
 }
 
-/// <summary>Module 7 owns chat and live delivery. The lobby polls; there is no push here.</summary>
-public sealed class NoChatRuntimeProbe : IChatRuntimeProbe
+/// <summary>
+/// Module 7, backend session B (M07-B2): chat persistence and lobby-event fan-out are live (docs/specs/
+/// module-07-realtime-presence-chat-spec.md) via <c>IChatService</c>/<c>ChatController</c>/hub
+/// <c>SendLobbyMessage</c> — always true because chat runtime availability does not depend on any external process
+/// being up (unlike the match runtime, it has no separate worker to poll).
+/// </summary>
+public sealed class LiveChatRuntimeProbe : IChatRuntimeProbe
 {
-    public Task<bool> IsAvailableAsync(CancellationToken ct = default) => Task.FromResult(false);
+    public Task<bool> IsAvailableAsync(CancellationToken ct = default) => Task.FromResult(true);
 }
 
 /// <summary>

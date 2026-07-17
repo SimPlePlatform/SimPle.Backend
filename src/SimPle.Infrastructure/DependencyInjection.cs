@@ -2,16 +2,23 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using SimPle.Application.Chat;
 using SimPle.Application.Common.Interfaces;
 using SimPle.Application.Common.Options;
 using SimPle.Application.Lobbies.Services;
+using SimPle.Application.Outbox;
+using SimPle.Application.Realtime;
+using SimPle.Application.Realtime.Outbox;
 using SimPle.Infrastructure.Auth;
+using SimPle.Infrastructure.Chat;
 using SimPle.Infrastructure.Email;
+using SimPle.Infrastructure.Health;
 using SimPle.Infrastructure.Lobbies;
 using SimPle.Infrastructure.Matchmaking;
 using SimPle.Infrastructure.Outbox;
 using SimPle.Infrastructure.Persistence;
 using SimPle.Infrastructure.Persistence.Repositories;
+using SimPle.Infrastructure.Realtime;
 using SimPle.Infrastructure.Storage;
 
 namespace SimPle.Infrastructure;
@@ -64,7 +71,7 @@ public static class DependencyInjection
         // what makes Start a 503, `allowedActions` omit `start`, and the UI's disabled controls truthful rather
         // than decorative. Each is replaced, not rewritten, when its module lands.
         services.AddSingleton<IMatchRuntimeProbe, NoMatchRuntimeProbe>();
-        services.AddSingleton<IChatRuntimeProbe, NoChatRuntimeProbe>();
+        services.AddSingleton<IChatRuntimeProbe, LiveChatRuntimeProbe>();
         services.AddSingleton<IAiParticipantProbe, NoAiParticipantProbe>();
 
         services.AddSingleton<ILobbyJoinThrottle, MemoryCacheLobbyJoinThrottle>();
@@ -75,6 +82,10 @@ public static class DependencyInjection
         });
         services.AddScoped<IFileStorageService, S3FileStorageService>();
         services.AddHttpClient<ICaptchaVerificationService, GoogleRecaptchaV2Service>();
+
+        // Readiness is intentionally process-local: this application is deployed as a single backend instance, so
+        // these durable workers and the API must share one lifecycle until a later distributed design is approved.
+        services.AddSingleton<IWorkerReadinessRegistry>(_ => new WorkerReadinessRegistry(RequiredWorkers.All));
 
         services.Configure<TokenCleanupOptions>(
             configuration.GetSection(TokenCleanupOptions.SectionName));
@@ -102,6 +113,36 @@ public static class DependencyInjection
         services.AddHostedService<MatchmakingWorker>();
         services.AddHostedService<LobbyExpiryWorker>();
         services.AddHostedService<OutboxDispatcherWorker>();
+
+        // Module 7 (docs/specs/module-07-realtime-presence-chat-spec.md), backend session A (M07-B1). The default
+        // IRealtimeConnectionCloser is a no-op so Auth flows never throw when the realtime hub is disabled (e.g. a
+        // rollback); the API composition root overrides this with the real SignalR-backed implementation once the
+        // hub is mapped (it needs the concrete hub type, which this project cannot reference). The rate limiter is
+        // SignalR-independent (pure System.Threading.RateLimiting), so it lives here rather than in the API layer.
+        services.AddSingleton<IRealtimeConnectionCloser, NullRealtimeConnectionCloser>();
+        services.AddSingleton<IRealtimeRateLimiter, RealtimeRateLimiter>();
+
+        // Module 7, backend session B (M07-B2). Registered now (ahead of the full step-8 DI pass) only so
+        // RealtimeHub's new IChatService constructor dependency and ChatController resolve — otherwise every
+        // existing hub-connection integration test would break the moment SendLobbyMessage was added to
+        // RealtimeHub.
+        services.Configure<ProfanityOptions>(configuration.GetSection(ProfanityOptions.SectionName));
+        services.AddScoped<IChatRepository, ChatRepository>();
+        services.AddSingleton<IChatProfanityFilter, ChatProfanityFilter>();
+        services.AddScoped<IChatService, ChatService>();
+        services.AddScoped<IOutboxActivationStore, OutboxActivationStore>();
+
+        // Step 8: chat runtime is now live (LiveChatRuntimeProbe swap above), and LobbyRealtimeHandler joins the
+        // outbox dispatcher's handler set the same way LobbyBlockHandler does (OutboxDispatcherWorker resolves
+        // every IOutboxHandler via GetServices<IOutboxHandler>() — see SimPle.Application/DependencyInjection.cs).
+        // It is registered here rather than there because this session's ownership boundary scopes DI wiring to
+        // this file.
+        services.AddScoped<IOutboxHandler, LobbyRealtimeHandler>();
+
+        // Step 9: the retention sweep (docs/specs/module-07-realtime-presence-chat-spec.md, Risk #5), modeled on
+        // TokenCleanupService above.
+        services.Configure<ChatRetentionOptions>(configuration.GetSection(ChatRetentionOptions.SectionName));
+        services.AddHostedService<ChatRetentionSweeper>();
 
         return services;
     }

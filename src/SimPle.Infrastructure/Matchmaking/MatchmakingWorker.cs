@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SimPle.Application.Common.Options;
 using SimPle.Application.Matchmaking.Services;
+using SimPle.Infrastructure.Health;
 
 namespace SimPle.Infrastructure.Matchmaking;
 
@@ -28,16 +29,19 @@ public sealed class MatchmakingWorker : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly MatchmakingOptions _options;
     private readonly ILogger<MatchmakingWorker> _logger;
+    private readonly IWorkerReadinessRegistry _readiness;
     private readonly string _workerId;
 
     public MatchmakingWorker(
         IServiceScopeFactory scopeFactory,
         IOptions<MatchmakingOptions> options,
-        ILogger<MatchmakingWorker> logger)
+        ILogger<MatchmakingWorker> logger,
+        IWorkerReadinessRegistry readiness)
     {
         _scopeFactory = scopeFactory;
         _options = options.Value;
         _logger = logger;
+        _readiness = readiness;
 
         // Machine name plus a random suffix: two instances on one host must not share an id, or their claims become
         // indistinguishable in exactly the situation the id exists to disambiguate. Budgeted to fit
@@ -54,8 +58,11 @@ public sealed class MatchmakingWorker : BackgroundService
             // The rollback plan calls for disabling the workers while preserving every lobby and ticket record.
             // Not hosting the loop is how that is done; nothing else changes.
             _logger.LogInformation("Matchmaking worker is disabled by configuration; not starting.");
+            _readiness.MarkUnhealthy(RequiredWorkers.Matchmaking);
             return;
         }
+
+        _readiness.MarkStarted(RequiredWorkers.Matchmaking);
 
         _logger.LogInformation(
             "Matchmaking worker started. WorkerId={WorkerId} Interval={Interval} BatchSize={BatchSize}",
@@ -94,9 +101,12 @@ public sealed class MatchmakingWorker : BackgroundService
                     _workerId, result.TicketsClaimed, result.ProposalsFormed, result.TicketsMatched,
                     (long?)result.OldestQueuedAge?.TotalMilliseconds);
             }
+
+            _readiness.MarkHealthy(RequiredWorkers.Matchmaking);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            _readiness.MarkUnhealthy(RequiredWorkers.Matchmaking);
             // A failed cycle is survivable by construction: the transaction rolled back, which released the
             // FOR UPDATE SKIP LOCKED row locks, which returned every claimed ticket to Queued. There is nothing to
             // compensate and nothing to clean up — the next cycle simply sees them again.

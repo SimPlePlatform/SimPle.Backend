@@ -1,0 +1,17 @@
+.git/
+.github/
+.vs/
+**/bin/
+**/obj/
+**/TestResults/
+coverage*/
+tests/
+docs/
+scripts/
+*.md
+*.suo
+*.user
+*.log
+src/SimPle.Api/.env
+src/SimPle.Api/appsettings.Development.json
+src/SimPle.Api/appsettings.Local.json
